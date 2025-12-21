@@ -8,7 +8,7 @@ import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import axios from 'axios';
 
-import { getApiUrl, checkApiKey } from '../config/api';
+import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
 import { useTheme } from '../contexts/ThemeContext';
 import { useLanguage } from '../contexts/LanguageContext';
 
@@ -33,7 +33,7 @@ const BusManagementScreen = () => {
             const apiUrl = await getApiUrl();
 
             const response = await axios.get(`${apiUrl}/api/buses`, {
-                headers: { 'Authorization': `Bearer ${apiKey}` },
+                headers: getApiHeaders(),
                 timeout: 5000
             });
 
@@ -75,7 +75,7 @@ const BusManagementScreen = () => {
         try {
             const apiKey = await checkApiKey();
             const apiUrl = await getApiUrl();
-            const headers = { 'Authorization': `Bearer ${apiKey}` };
+            const headers = getApiHeaders();
 
             if (editingBus) {
                 // Update existing bus
@@ -120,7 +120,7 @@ const BusManagementScreen = () => {
                             const apiKey = await checkApiKey();
                             const apiUrl = await getApiUrl();
                             await axios.delete(`${apiUrl}/api/buses/${bus.mac_address}`, {
-                                headers: { 'Authorization': `Bearer ${apiKey}` }
+                                headers: getApiHeaders()
                             });
                             Alert.alert('Success', 'Bus deleted');
                             loadBuses();

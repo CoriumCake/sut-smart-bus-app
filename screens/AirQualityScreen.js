@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, FlatList, Platform, TouchableOpacity, Alert } from 'react-native';
 import * as Location from 'expo-location';
 import axios from 'axios';
-import { getApiUrl, checkApiKey } from '../config/api';
+import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
 import { useDebug } from '../contexts/DebugContext';
 import { useServerConfig } from '../hooks/useServerConfig';
 import { getAirQualityStatus } from '../utils/airQuality';
@@ -45,7 +45,7 @@ const AirQualityScreen = () => {
         }
         const apiUrl = await getApiUrl();
         const response = await axios.get(`${apiUrl}/api/buses`, {
-          headers: { 'Authorization': `Bearer ${apiKey}` },
+          headers: getApiHeaders(),
           timeout: 5000
         });
         const newBuses = response.data;

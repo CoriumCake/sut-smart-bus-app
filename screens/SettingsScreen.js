@@ -5,7 +5,7 @@ import { useDebug } from '../contexts/DebugContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useLanguage } from '../contexts/LanguageContext';
 import { useNotifications } from '../contexts/NotificationContext';
-import { API_BASE } from '../config/api';
+import { API_BASE, getApiHeaders } from '../config/api';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -29,7 +29,7 @@ const SettingsScreen = () => {
       }
       setApiLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/count`);
+        const response = await fetch(`${API_BASE}/count`, { headers: getApiHeaders() });
         if (response.ok) {
           const data = await response.json();
           setApiCount(data.passengers !== undefined ? data.passengers : 'N/A');

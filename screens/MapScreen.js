@@ -6,7 +6,7 @@ import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useDebug } from '../contexts/DebugContext';
 import { useTheme } from '../contexts/ThemeContext';
-import { API_BASE, getApiUrl, checkApiKey } from '../config/api';
+import { API_BASE, getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG } from '../config/api';
 import { getRouteIdForBus } from '../utils/busRouteMapping';
 import { loadRoute } from '../utils/routeStorage';
 import * as mqtt from 'mqtt'; // <-- ADDED: MQTT Client
@@ -490,7 +490,7 @@ const MapScreen = () => {
   useEffect(() => {
     const fetchCount = async () => {
       try {
-        const response = await fetch(`${API_BASE}/count`);
+        const response = await fetch(`${API_BASE}/count`, { headers: getApiHeaders() });
         if (response.ok) {
           const data = await response.json();
           // Only update if value changed (prevents unnecessary re-renders)
@@ -576,7 +576,7 @@ const MapScreen = () => {
       if (!apiKey) return;
       const apiUrl = await getApiUrl();
       const response = await axios.get(`${apiUrl}/api/buses`, {
-        headers: { 'Authorization': `Bearer ${apiKey}` },
+        headers: getApiHeaders(),
         timeout: 5000
       });
       if (response.data && Array.isArray(response.data)) {
@@ -594,9 +594,7 @@ const MapScreen = () => {
       if (!apiKey) return;
       const apiUrl = await getApiUrl();
       const response = await axios.get(`${apiUrl}/api/routes`, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`
-        },
+        headers: getApiHeaders(),
         timeout: 5000
       });
       const routesData = response.data;
@@ -608,7 +606,7 @@ const MapScreen = () => {
         routesData.map(async (route) => {
           try {
             const stopsResponse = await axios.get(`${apiUrl}/api/routes/${route.id}/stops`, {
-              headers: { 'Authorization': `Bearer ${apiKey}` },
+              headers: getApiHeaders(),
               timeout: 5000
             });
             return {

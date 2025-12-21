@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { View, Text, FlatList, StyleSheet, TouchableOpacity, Alert, Platform, RefreshControl } from 'react-native';
 import axios from 'axios';
-import { API_BASE, getApiUrl, checkApiKey } from '../config/api';
+import { API_BASE, getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
@@ -28,7 +28,7 @@ const RoutesScreen = () => {
   useEffect(() => {
     const fetchCount = async () => {
       try {
-        const response = await fetch(`${API_BASE}/count`);
+        const response = await fetch(`${API_BASE}/count`, { headers: getApiHeaders() });
         if (response.ok) {
           const data = await response.json();
           if (data.passengers !== undefined) {
@@ -54,7 +54,7 @@ const RoutesScreen = () => {
       let fetchedBuses = [];
       try {
         const response = await axios.get(`${apiUrl}/api/buses`, {
-          headers: { 'Authorization': `Bearer ${apiKey}` },
+          headers: getApiHeaders(),
           timeout: 5000
         });
         if (response.data && Array.isArray(response.data)) {

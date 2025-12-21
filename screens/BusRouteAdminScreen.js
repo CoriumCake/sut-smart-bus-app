@@ -9,7 +9,7 @@ import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import axios from 'axios';
 
-import { getApiUrl, checkApiKey } from '../config/api';
+import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
 import { getAllRoutes } from '../utils/routeStorage';
 import { getAllMappings, assignRouteToBus } from '../utils/busRouteMapping';
 
@@ -30,7 +30,7 @@ const BusRouteAdminScreen = () => {
 
             try {
                 const busResponse = await axios.get(`${apiUrl}/api/buses`, {
-                    headers: { 'Authorization': `Bearer ${apiKey}` },
+                    headers: getApiHeaders(),
                     timeout: 5000
                 });
                 if (busResponse.data && Array.isArray(busResponse.data)) {
