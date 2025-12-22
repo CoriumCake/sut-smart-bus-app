@@ -139,8 +139,53 @@ const MapScreen = () => {
   const [simulationSpeed, setSimulationSpeed] = useState(20); // Simulation speed in m/s (default 20 = ~72km/h)
   const [currentStopName, setCurrentStopName] = useState(null); // Show stop name when bus arrives
 
+  // Debug Location Override - allows testing anywhere by faking user position
+  const [debugLocationEnabled, setDebugLocationEnabled] = useState(false);
+  const [debugLocation, setDebugLocation] = useState(null); // {latitude, longitude}
+
+  // Effective user location (debug override or real GPS)
+  const effectiveUserLocation = debugMode && debugLocationEnabled && debugLocation
+    ? debugLocation
+    : userLocation;
+
   // Active route is either from navigation (selectedRoute) or from tapping a bus (busSelectedRoute)
   const activeRoute = selectedRoute || busSelectedRoute;
+
+  // Calculate user's closest stop index based on their (or debug) location
+  // This is used to show "Next Stop" from the user's perspective
+  const userStopIndex = useMemo(() => {
+    if (!activeRoute?.waypoints || !effectiveUserLocation) return 0;
+
+    const stops = activeRoute.waypoints.filter(wp => wp.isStop && wp.stopName);
+    if (stops.length === 0) return 0;
+
+    // Find the closest stop to user's location
+    let closestIndex = 0;
+    let minDistance = Infinity;
+
+    stops.forEach((stop, index) => {
+      const dist = getDistanceFromLatLonInM_Static(
+        effectiveUserLocation.latitude, effectiveUserLocation.longitude,
+        stop.latitude, stop.longitude
+      );
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestIndex = index;
+      }
+    });
+
+    // If user is close to a stop (within 100m), consider it passed and show next stop
+    // Otherwise show the closest stop as the upcoming one
+    if (minDistance < 100) {
+      return closestIndex + 1; // Next stop after the one they're at
+    }
+    return closestIndex;
+  }, [activeRoute, effectiveUserLocation]);
+
+  // Use userStopIndex when debug location is enabled, otherwise use bus-based currentStopIndex
+  const effectiveStopIndex = (debugMode && debugLocationEnabled && debugLocation)
+    ? userStopIndex
+    : currentStopIndex;
 
   // Animation Refs
   const animationRef = useRef(null);
@@ -228,6 +273,7 @@ const MapScreen = () => {
 
   // Memoize stop markers data with loop detection
   // Hides distant stops that are geographically close to upcoming stops
+  // Uses effectiveStopIndex to show correct stops based on user's (or debug) position
   const stopMarkers = useMemo(() => {
     if (!activeRoute?.waypoints) return [];
 
@@ -237,9 +283,9 @@ const MapScreen = () => {
         ...stop,
         index,
         stopNumber: index + 1,
-        stopsAhead: index - currentStopIndex,
-        isUpcoming: (index - currentStopIndex) >= 0 && (index - currentStopIndex) < 2, // Only next 2 stops
-        isPassed: (index - currentStopIndex) < 0,
+        stopsAhead: index - effectiveStopIndex,
+        isUpcoming: (index - effectiveStopIndex) >= 0 && (index - effectiveStopIndex) < 2, // Only next 2 stops
+        isPassed: (index - effectiveStopIndex) < 0,
         isHiddenByNearby: false, // Will be set below
       }));
 
@@ -269,7 +315,7 @@ const MapScreen = () => {
     }
 
     return allStops;
-  }, [activeRoute, currentStopIndex]);
+  }, [activeRoute, effectiveStopIndex]);
 
   const [mapLoadError, setMapLoadError] = useState(false);
 
@@ -525,18 +571,20 @@ const MapScreen = () => {
 
   // --- AUTO-EXIT LOGIC ---
   // If user moves far from the bus, assume they got off and exit Riding Mode
+  // Uses effectiveUserLocation to work with debug location override
   useEffect(() => {
-    if (ridingBus && userLocation && ridingBus.current_lat) {
+    const currentUserLoc = effectiveUserLocation;
+    if (ridingBus && currentUserLoc && ridingBus.current_lat) {
       // Find current position of the riding bus (streaming updates)
       const currentBus = buses.find(b => b.id === ridingBus.id || b.bus_mac === ridingBus.bus_mac);
       if (currentBus) {
         const dist = getDistanceFromLatLonInM_Static(
-          userLocation.latitude, userLocation.longitude,
+          currentUserLoc.latitude, currentUserLoc.longitude,
           currentBus.current_lat, currentBus.current_lon
         );
 
-        // Threshold: 100 meters
-        if (dist > 100) {
+        // Threshold: 100 meters (disable in debug mode with fake location to allow testing)
+        if (dist > 100 && !debugLocationEnabled) {
           console.log(`[AutoExit] Distance ${dist}m > 100m. Exiting bus mode.`);
           setRidingBus(null);
           setBusSignal(null);
@@ -544,7 +592,7 @@ const MapScreen = () => {
         }
       }
     }
-  }, [userLocation, buses, ridingBus]);
+  }, [effectiveUserLocation, buses, ridingBus, debugLocationEnabled]);
 
   useFocusEffect(
     React.useCallback(() => {
@@ -656,14 +704,17 @@ const MapScreen = () => {
   };
 
   const zoomToLocation = async () => {
-    if (!userLocation) {
+    // Use debug location if enabled
+    const targetLocation = effectiveUserLocation;
+
+    if (!targetLocation) {
       await getLocation();
     }
 
-    if (userLocation && mapRef.current) {
+    if (targetLocation && mapRef.current) {
       mapRef.current.animateToRegion({
-        latitude: userLocation.latitude,
-        longitude: userLocation.longitude,
+        latitude: targetLocation.latitude,
+        longitude: targetLocation.longitude,
         latitudeDelta: 0.005,
         longitudeDelta: 0.005,
       });
@@ -673,6 +724,22 @@ const MapScreen = () => {
         Alert.alert('Location Unavailable', 'Zooming to Suranaree University of Technology (Default).');
       }
     }
+  };
+
+  // Initialize debug location to SUT campus center when enabled
+  const enableDebugLocation = () => {
+    if (!debugLocation) {
+      setDebugLocation({
+        latitude: SUT_COORDINATES.latitude,
+        longitude: SUT_COORDINATES.longitude,
+      });
+    }
+    setDebugLocationEnabled(true);
+  };
+
+  // Handle dragging the debug location marker
+  const handleDebugMarkerDrag = (e) => {
+    setDebugLocation(e.nativeEvent.coordinate);
   };
 
   const getAirQualityStatus = (value) => {
@@ -1228,6 +1295,37 @@ const MapScreen = () => {
             )}
           </Marker>
         ))}
+
+        {/* Debug Location Marker - Draggable fake user position */}
+        {debugMode && debugLocationEnabled && debugLocation && (
+          <Marker
+            coordinate={debugLocation}
+            title="📍 Debug Location"
+            description="Drag to simulate your position"
+            pinColor="blue"
+            draggable
+            onDragEnd={handleDebugMarkerDrag}
+            anchor={{ x: 0.5, y: 0.5 }}
+          >
+            <View style={{
+              backgroundColor: '#3b82f6',
+              width: 40,
+              height: 40,
+              borderRadius: 20,
+              borderWidth: 3,
+              borderColor: 'white',
+              justifyContent: 'center',
+              alignItems: 'center',
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.3,
+              shadowRadius: 3,
+              elevation: 5,
+            }}>
+              <Ionicons name="person" size={22} color="white" />
+            </View>
+          </Marker>
+        )}
       </MapView>
 
       {showGrid && <GridOverlay />}
@@ -1294,6 +1392,64 @@ const MapScreen = () => {
                 <TouchableOpacity onPress={() => setWaypoints([])}>
                   <Text style={{ color: 'red', fontSize: 12 }}>Clear Path</Text>
                 </TouchableOpacity>
+              </View>
+
+              {/* Debug Location Override Toggle */}
+              <View style={{ marginTop: 10, borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
+                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>📍 Fake Location</Text>
+                <TouchableOpacity
+                  style={[styles.actionBtn, { backgroundColor: debugLocationEnabled ? '#3b82f6' : '#9ca3af' }]}
+                  onPress={() => {
+                    if (debugLocationEnabled) {
+                      setDebugLocationEnabled(false);
+                    } else {
+                      enableDebugLocation();
+                    }
+                  }}
+                >
+                  <Text style={styles.actionBtnText}>
+                    {debugLocationEnabled ? '📍 Location Override ON' : '📍 Enable Fake Location'}
+                  </Text>
+                </TouchableOpacity>
+                {debugLocationEnabled && debugLocation && (
+                  <Text style={{ fontSize: 10, color: '#666', marginTop: 5 }}>
+                    Drag the blue marker to move your position
+                  </Text>
+                )}
+              </View>
+
+              {/* Force Ride Bus Debug Button */}
+              <View style={{ marginTop: 10, borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
+                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>🚌 Riding Card Test</Text>
+                {ridingBus ? (
+                  <TouchableOpacity
+                    style={[styles.actionBtn, { backgroundColor: '#ef4444' }]}
+                    onPress={() => {
+                      setRidingBus(null);
+                      setBusSignal(null);
+                    }}
+                  >
+                    <Text style={styles.actionBtnText}>🚫 Exit Riding Mode</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity
+                    style={[styles.actionBtn, { backgroundColor: '#8b5cf6' }]}
+                    onPress={() => {
+                      if (buses.length > 0) {
+                        const testBus = buses[0];
+                        setRidingBus(testBus);
+                        setBusSignal(-55); // Mock signal
+                        // Also load the bus route if available
+                        handleBusPress(testBus);
+                        Alert.alert('Debug', `Now riding: ${testBus.bus_name || testBus.bus_mac}`);
+                      } else {
+                        Alert.alert('No Buses', 'No buses available. Make sure the server is running.');
+                      }
+                    }}
+                  >
+                    <Text style={styles.actionBtnText}>🚌 Force Ride First Bus</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             </View>
           )}

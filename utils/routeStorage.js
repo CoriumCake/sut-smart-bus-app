@@ -1,4 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import axios from 'axios';
+import { API_BASE, getApiUrl, getApiHeaders } from '../config/api';
 
 const ROUTES_STORAGE_KEY = '@sut_bus_routes';
 
@@ -171,5 +173,145 @@ export const exportAllRoutesToJSON = async () => {
     } catch (error) {
         console.error('Error exporting all routes:', error);
         return null;
+    }
+};
+
+// =============================================================================
+// Server Sync Functions
+// These enable routes to be shared across all users via the server
+// =============================================================================
+
+/**
+ * Sync a single route to the server
+ * @param {Object} route - Full route object with routeId, routeName, waypoints, etc.
+ * @returns {Promise<boolean>} Success status
+ */
+export const syncRouteToServer = async (route) => {
+    try {
+        const apiUrl = await getApiUrl();
+        const response = await axios.post(`${apiUrl}/api/routes`, route, {
+            headers: getApiHeaders(),
+            timeout: 10000
+        });
+        console.log(`[RouteSync] ✅ Synced to server: ${route.routeName}`);
+        return response.data?.success || false;
+    } catch (error) {
+        console.error('[RouteSync] Error syncing route to server:', error.message);
+        return false;
+    }
+};
+
+/**
+ * Fetch list of all routes from server (basic info only)
+ * @returns {Promise<Array>} Array of route summaries
+ */
+export const fetchRoutesFromServer = async () => {
+    try {
+        const apiUrl = await getApiUrl();
+        const response = await axios.get(`${apiUrl}/api/routes/list`, {
+            headers: getApiHeaders(),
+            timeout: 10000
+        });
+        console.log(`[RouteSync] 📥 Fetched ${response.data?.count || 0} routes from server`);
+        return response.data?.routes || [];
+    } catch (error) {
+        console.error('[RouteSync] Error fetching routes from server:', error.message);
+        return [];
+    }
+};
+
+/**
+ * Fetch a complete route from server by ID
+ * @param {string} routeId - Route ID to fetch
+ * @returns {Promise<Object|null>} Full route object or null
+ */
+export const fetchRouteFromServer = async (routeId) => {
+    try {
+        const apiUrl = await getApiUrl();
+        const response = await axios.get(`${apiUrl}/api/routes/${routeId}`, {
+            headers: getApiHeaders(),
+            timeout: 10000
+        });
+        console.log(`[RouteSync] 📥 Fetched route: ${response.data?.routeName}`);
+        return response.data || null;
+    } catch (error) {
+        console.error(`[RouteSync] Error fetching route ${routeId}:`, error.message);
+        return null;
+    }
+};
+
+/**
+ * Delete a route from the server
+ * @param {string} routeId - Route ID to delete
+ * @returns {Promise<boolean>} Success status
+ */
+export const deleteRouteFromServer = async (routeId) => {
+    try {
+        const apiUrl = await getApiUrl();
+        await axios.delete(`${apiUrl}/api/routes/${routeId}`, {
+            headers: getApiHeaders(),
+            timeout: 10000
+        });
+        console.log(`[RouteSync] 🗑️ Deleted from server: ${routeId}`);
+        return true;
+    } catch (error) {
+        console.error(`[RouteSync] Error deleting route ${routeId}:`, error.message);
+        return false;
+    }
+};
+
+/**
+ * Sync all local routes to server (for admin use)
+ * @returns {Promise<{synced: number, failed: number}>} Sync results
+ */
+export const syncAllRoutesToServer = async () => {
+    const routes = await getAllRoutes();
+    let synced = 0;
+    let failed = 0;
+
+    for (const route of routes) {
+        const success = await syncRouteToServer(route);
+        if (success) {
+            synced++;
+        } else {
+            failed++;
+        }
+    }
+
+    console.log(`[RouteSync] Bulk sync complete: ${synced} synced, ${failed} failed`);
+    return { synced, failed };
+};
+
+/**
+ * Download all routes from server and save locally
+ * Used on app startup to get latest routes
+ * @returns {Promise<number>} Number of routes downloaded
+ */
+export const downloadRoutesFromServer = async () => {
+    try {
+        const serverRoutes = await fetchRoutesFromServer();
+        let downloaded = 0;
+
+        for (const summary of serverRoutes) {
+            // Fetch full route data
+            const fullRoute = await fetchRouteFromServer(summary.routeId);
+            if (fullRoute) {
+                // Save to local storage
+                await saveRoute(
+                    fullRoute.routeId,
+                    fullRoute.routeName,
+                    fullRoute.waypoints,
+                    fullRoute.busId,
+                    fullRoute.routeColor
+                );
+                downloaded++;
+            }
+        }
+
+        console.log(`[RouteSync] 📥 Downloaded ${downloaded} routes from server`);
+        return downloaded;
+    } catch (error) {
+        console.error('[RouteSync] Error downloading routes:', error.message);
+        return 0;
     }
 };

@@ -9,7 +9,7 @@ import { useDebug } from '../contexts/DebugContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useLanguage } from '../contexts/LanguageContext';
 
-import { getAllRoutes, loadRoute } from '../utils/routeStorage';
+import { getAllRoutes, loadRoute, downloadRoutesFromServer } from '../utils/routeStorage';
 import { getAllMappings, getRouteIdForBus } from '../utils/busRouteMapping';
 import { findNextStop } from '../utils/routeHelpers';
 
@@ -47,6 +47,10 @@ const RoutesScreen = () => {
   // Load buses and their assigned routes
   const loadData = useCallback(async () => {
     try {
+      // First, sync routes from server to local storage
+      // This ensures all clients have the latest routes
+      await downloadRoutesFromServer();
+
       // Fetch buses from server
       const apiKey = await checkApiKey();
       const apiUrl = await getApiUrl();

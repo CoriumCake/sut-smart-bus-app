@@ -4,7 +4,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Location from 'expo-location';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
-import { saveRoute, loadRoute, generateRouteId } from '../utils/routeStorage';
+import { saveRoute, loadRoute, generateRouteId, syncRouteToServer } from '../utils/routeStorage';
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -181,7 +181,23 @@ const RouteEditorScreen = () => {
             const success = await saveRoute(id, routeName, waypoints, busIdToSave, routeColor);
 
             if (success) {
-                Alert.alert('Success', 'Route saved successfully', [
+                // Build the full route object for server sync
+                const routeForServer = {
+                    routeId: id,
+                    routeName: routeName,
+                    waypoints: waypoints,
+                    busId: busIdToSave,
+                    routeColor: routeColor,
+                };
+
+                // Sync to server (non-blocking, but we show status)
+                const serverSynced = await syncRouteToServer(routeForServer);
+
+                const syncMessage = serverSynced
+                    ? 'Route saved and synced to server! ✅'
+                    : 'Route saved locally. Server sync failed (offline mode).';
+
+                Alert.alert('Success', syncMessage, [
                     { text: 'OK', onPress: () => navigation.goBack() }
                 ]);
             } else {
