@@ -10,7 +10,7 @@ import { Ionicons } from '@expo/vector-icons';
 import axios from 'axios';
 
 import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
-import { getAllRoutes } from '../utils/routeStorage';
+import { getAllRoutes, syncAllRoutesToServer } from '../utils/routeStorage';
 import { getAllMappings, assignRouteToBus } from '../utils/busRouteMapping';
 
 const BusRouteAdminScreen = () => {
@@ -19,6 +19,7 @@ const BusRouteAdminScreen = () => {
     const [routes, setRoutes] = useState([]);
     const [mappings, setMappings] = useState({});
     const [loading, setLoading] = useState(true);
+    const [syncing, setSyncing] = useState(false);
 
     // Fetch buses from API and routes from local storage
     const loadData = useCallback(async () => {
@@ -59,6 +60,34 @@ const BusRouteAdminScreen = () => {
     useEffect(() => {
         loadData();
     }, [loadData]);
+
+    // Sync all local routes to server
+    const handleSyncToServer = async () => {
+        if (routes.length === 0) {
+            Alert.alert('No Routes', 'There are no local routes to sync.');
+            return;
+        }
+
+        setSyncing(true);
+        try {
+            const result = await syncAllRoutesToServer();
+            if (result.synced > 0) {
+                Alert.alert(
+                    '✅ Sync Complete',
+                    `${result.synced} routes synced to server.${result.failed > 0 ? `\n${result.failed} failed.` : ''}`
+                );
+            } else if (result.failed > 0) {
+                Alert.alert('❌ Sync Failed', `Failed to sync ${result.failed} routes. Is the server running?`);
+            } else {
+                Alert.alert('Info', 'No routes to sync.');
+            }
+        } catch (error) {
+            console.error('Sync error:', error);
+            Alert.alert('Error', 'Failed to sync routes to server.');
+        } finally {
+            setSyncing(false);
+        }
+    };
 
     // Handle route selection for a bus
     const handleRouteChange = async (busMac, routeId) => {
@@ -132,16 +161,32 @@ const BusRouteAdminScreen = () => {
                     <Ionicons name="arrow-back" size={24} color="#333" />
                 </TouchableOpacity>
                 <Text style={styles.title}>Bus Route Assignment</Text>
-                <TouchableOpacity onPress={loadData} style={styles.refreshButton}>
-                    <Ionicons name="refresh" size={24} color="#2563eb" />
-                </TouchableOpacity>
+                <View style={styles.headerButtons}>
+                    <TouchableOpacity
+                        onPress={handleSyncToServer}
+                        style={[styles.syncButton, syncing && styles.syncButtonDisabled]}
+                        disabled={syncing}
+                    >
+                        {syncing ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                            <>
+                                <Ionicons name="cloud-upload" size={18} color="#fff" />
+                                <Text style={styles.syncButtonText}>Sync</Text>
+                            </>
+                        )}
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={loadData} style={styles.refreshButton}>
+                        <Ionicons name="refresh" size={24} color="#2563eb" />
+                    </TouchableOpacity>
+                </View>
             </View>
 
             {/* Info Banner */}
             <View style={styles.infoBanner}>
                 <Ionicons name="information-circle" size={20} color="#0066cc" />
                 <Text style={styles.infoText}>
-                    Assign routes to buses. Changes save automatically.
+                    Assign routes to buses. Tap "Sync" to share routes with all users.
                 </Text>
             </View>
 
@@ -215,6 +260,28 @@ const styles = StyleSheet.create({
         fontSize: 18,
         fontWeight: 'bold',
         color: '#333',
+    },
+    headerButtons: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
+    syncButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#10b981',
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 16,
+        gap: 4,
+    },
+    syncButtonDisabled: {
+        backgroundColor: '#9ca3af',
+    },
+    syncButtonText: {
+        color: '#fff',
+        fontSize: 13,
+        fontWeight: '600',
     },
     refreshButton: {
         padding: 4,
