@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { View, StyleSheet, TouchableOpacity, Text, Alert, Platform, Image, Animated, Easing, Dimensions } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, Text, Alert, Platform, Image, Animated, Easing, Dimensions, ScrollView } from 'react-native';
 import { useFocusEffect, useRoute, useNavigation } from '@react-navigation/native';
 import * as Location from 'expo-location';
 import axios from 'axios';
@@ -8,7 +8,7 @@ import { useDebug } from '../contexts/DebugContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { API_BASE, getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG } from '../config/api';
 import { getRouteIdForBus } from '../utils/busRouteMapping';
-import { loadRoute } from '../utils/routeStorage';
+import { loadRoute, getAllRoutes } from '../utils/routeStorage';
 import * as mqtt from 'mqtt'; // <-- ADDED: MQTT Client
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { whiteMapStyle, darkMapStyle } from '../utils/mapStyles';
@@ -44,6 +44,42 @@ const getDistanceFromLatLonInM_Static = (lat1, lon1, lat2, lon2) => {
   var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   var d = R * c; // Distance in km
   return d * 1000; // Distance in m
+};
+
+// PERFORMANCE: Douglas-Peucker polyline simplification
+// Reduces points while preserving shape - tolerance in degrees (~5m per 0.00005)
+const perpendicularDistance = (point, lineStart, lineEnd) => {
+  const dx = lineEnd.longitude - lineStart.longitude;
+  const dy = lineEnd.latitude - lineStart.latitude;
+  const mag = Math.sqrt(dx * dx + dy * dy);
+  if (mag === 0) return 0;
+  const u = ((point.longitude - lineStart.longitude) * dx + (point.latitude - lineStart.latitude) * dy) / (mag * mag);
+  const closestX = lineStart.longitude + u * dx;
+  const closestY = lineStart.latitude + u * dy;
+  return Math.sqrt(Math.pow(point.longitude - closestX, 2) + Math.pow(point.latitude - closestY, 2));
+};
+
+const simplifyPolyline = (points, tolerance = 0.00003) => {
+  if (!points || points.length < 3) return points;
+
+  let maxDist = 0;
+  let maxIdx = 0;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const dist = perpendicularDistance(points[i], points[0], points[points.length - 1]);
+    if (dist > maxDist) {
+      maxDist = dist;
+      maxIdx = i;
+    }
+  }
+
+  if (maxDist > tolerance) {
+    const left = simplifyPolyline(points.slice(0, maxIdx + 1), tolerance);
+    const right = simplifyPolyline(points.slice(maxIdx), tolerance);
+    return [...left.slice(0, -1), ...right];
+  }
+
+  return [points[0], points[points.length - 1]];
 };
 
 // Grid Overlay Component for Visual Alignment
@@ -114,7 +150,7 @@ let client = null;
 const MapScreen = () => {
   const route = useRoute();
   const navigation = useNavigation();
-  const { selectedRoute } = route.params || {};
+  const { selectedRoute, focusBus } = route.params || {};
 
   const { debugMode } = useDebug();
   const { isDark } = useTheme();
@@ -143,16 +179,176 @@ const MapScreen = () => {
   const [debugLocationEnabled, setDebugLocationEnabled] = useState(false);
   const [debugLocation, setDebugLocation] = useState(null); // {latitude, longitude}
 
+  // Fake Bus for testing proximity boarding
+  const [fakeBusEnabled, setFakeBusEnabled] = useState(false);
+  const [fakeBusLocation, setFakeBusLocation] = useState(null); // {latitude, longitude}
+
+  // Debug panel tab state: 'simulation' or 'testing'
+  const [debugTab, setDebugTab] = useState('simulation');
+
+  // All routes for displaying all stops on map load
+  const [allRoutes, setAllRoutes] = useState([]);
+  const [highlightedRouteId, setHighlightedRouteId] = useState(null);
+
+  // PERFORMANCE: Track map region for viewport culling
+  const [mapRegion, setMapRegion] = useState({
+    latitude: 14.8820,
+    longitude: 102.0207,
+    latitudeDelta: 0.02,
+    longitudeDelta: 0.02,
+  });
+  const regionDebounceRef = useRef(null);
+
+  // MARKER RENDERING: Allow initial render, then disable for performance
+  const [markersReady, setMarkersReady] = useState(false);
+
   // Effective user location (debug override or real GPS)
   const effectiveUserLocation = debugMode && debugLocationEnabled && debugLocation
     ? debugLocation
     : userLocation;
 
+  // Merge fake bus into buses array when enabled
+  const busesWithFake = useMemo(() => {
+    if (!debugMode || !fakeBusEnabled || !fakeBusLocation) return buses;
+
+    const fakeBus = {
+      id: 'FAKE-BUS-TEST',
+      bus_mac: 'FAKE-BUS-TEST',
+      bus_name: '🧪 Fake Test Bus',
+      current_lat: fakeBusLocation.latitude,
+      current_lon: fakeBusLocation.longitude,
+      seats_available: 30,
+      pm2_5: 12,
+      isFake: true
+    };
+
+    return [...buses, fakeBus];
+  }, [buses, debugMode, fakeBusEnabled, fakeBusLocation]);
+
   // Active route is either from navigation (selectedRoute) or from tapping a bus (busSelectedRoute)
   const activeRoute = selectedRoute || busSelectedRoute;
 
+  // Calculate bus's stop index based on its position ALONG THE ROUTE PATH
+  // This tracks which stops the bus has passed by projecting its position onto the route
+  // OPTIMIZED: Only extract target bus location to avoid recalculating on every bus update
+  const targetBusLocation = useMemo(() => {
+    if (!activeRoute?.waypoints) return null;
+
+    // For fake bus testing, use the fake bus location when available
+    if (debugMode && fakeBusEnabled && fakeBusLocation) {
+      return {
+        latitude: fakeBusLocation.latitude,
+        longitude: fakeBusLocation.longitude
+      };
+    }
+
+    // Check if this route is for the fake bus (no assigned bus_id or bus_id is FAKE-BUS-TEST)
+    const targetBusId = activeRoute.bus_id || activeRoute.busId;
+
+    // If no bus_id and fake bus is enabled, use fake bus location from busesWithFake
+    if (!targetBusId && debugMode && fakeBusEnabled) {
+      // Find fake bus in the bus list
+      const fakeBus = busesWithFake.find(b => b.isFake);
+      if (fakeBus && fakeBus.current_lat && fakeBus.current_lon) {
+        return {
+          latitude: fakeBus.current_lat,
+          longitude: fakeBus.current_lon
+        };
+      }
+    }
+
+    const routeBus = buses.find(b =>
+      (b.bus_mac || b.mac_address || b.id) === targetBusId
+    );
+
+    if (!routeBus || !routeBus.current_lat || !routeBus.current_lon) {
+      return null;
+    }
+
+    return {
+      latitude: routeBus.current_lat,
+      longitude: routeBus.current_lon
+    };
+  }, [activeRoute, buses, busesWithFake, debugMode, fakeBusEnabled, fakeBusLocation]);
+
+  // Throttle busBasedStopIndex to only update when bus moves significantly
+  // Also track routeId to invalidate cache when switching routes
+  const lastBusStopCalc = useRef({ lat: 0, lon: 0, result: 0, routeId: null });
+
+  const busBasedStopIndex = useMemo(() => {
+    if (!activeRoute?.waypoints || activeRoute.waypoints.length < 2 || !targetBusLocation) {
+      return 0;
+    }
+
+    // Skip recalculation if same route and bus hasn't moved more than 20 meters
+    const lastCalc = lastBusStopCalc.current;
+    const isSameRoute = lastCalc.routeId === activeRoute.routeId;
+    const moveDist = getDistanceFromLatLonInM_Static(
+      lastCalc.lat, lastCalc.lon,
+      targetBusLocation.latitude, targetBusLocation.longitude
+    );
+    if (isSameRoute && moveDist < 20 && lastCalc.result > 0) {
+      return lastCalc.result;
+    }
+
+    const fullPath = activeRoute.waypoints;
+
+    // Find the closest segment on the route to the bus
+    let minDistance = Infinity;
+    let closestSegmentIndex = 0;
+
+    for (let i = 0; i < fullPath.length - 1; i++) {
+      const segStart = fullPath[i];
+      const segEnd = fullPath[i + 1];
+
+      // Calculate perpendicular distance from bus to segment
+      const dx = segEnd.latitude - segStart.latitude;
+      const dy = segEnd.longitude - segStart.longitude;
+      const lenSq = dx * dx + dy * dy;
+
+      if (lenSq === 0) continue;
+
+      // Project bus onto segment
+      const t = Math.max(0, Math.min(1, (
+        ((targetBusLocation.latitude - segStart.latitude) * dx) +
+        ((targetBusLocation.longitude - segStart.longitude) * dy)
+      ) / lenSq));
+
+      const projLat = segStart.latitude + t * dx;
+      const projLon = segStart.longitude + t * dy;
+
+      // Approximate distance (faster than haversine for short distances)
+      const dLat = targetBusLocation.latitude - projLat;
+      const dLon = targetBusLocation.longitude - projLon;
+      const dist = dLat * dLat + dLon * dLon; // Squared distance for comparison
+
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestSegmentIndex = i;
+      }
+    }
+
+    // Count how many stops are BEFORE or AT the current segment
+    let passedStopsCount = 0;
+    for (let i = 0; i <= closestSegmentIndex; i++) {
+      if (fullPath[i].isStop && fullPath[i].stopName) {
+        passedStopsCount++;
+      }
+    }
+
+    // Cache result with routeId to invalidate when switching routes
+    lastBusStopCalc.current = {
+      lat: targetBusLocation.latitude,
+      lon: targetBusLocation.longitude,
+      result: passedStopsCount,
+      routeId: activeRoute.routeId
+    };
+
+    return passedStopsCount;
+  }, [activeRoute, targetBusLocation]);
+
   // Calculate user's closest stop index based on their (or debug) location
-  // This is used to show "Next Stop" from the user's perspective
+  // This is only used when debug location is enabled (for testing)
   const userStopIndex = useMemo(() => {
     if (!activeRoute?.waypoints || !effectiveUserLocation) return 0;
 
@@ -182,10 +378,11 @@ const MapScreen = () => {
     return closestIndex;
   }, [activeRoute, effectiveUserLocation]);
 
-  // Use userStopIndex when debug location is enabled, otherwise use bus-based currentStopIndex
+  // Priority: 1) Real-time currentStopIndex from MQTT, 2) busBasedStopIndex, 3) userStopIndex for debug
   const effectiveStopIndex = (debugMode && debugLocationEnabled && debugLocation)
     ? userStopIndex
-    : currentStopIndex;
+    : (currentStopIndex > 0 ? currentStopIndex : busBasedStopIndex);
+
 
   // Animation Refs
   const animationRef = useRef(null);
@@ -207,12 +404,27 @@ const MapScreen = () => {
   // Track progress to prevent backward jumps
   const lastProgressRef = useRef(0);
   const lastSnappedIndexRef = useRef(0); // <-- ADDED: Track route index
-  // Refs for infinite-closure access in MQTT
   const busesRef = useRef([]);
   const selectedRouteRef = useRef(null);
   const ridingBusRef = useRef(null);
   const lastShownStopRef = useRef(null); // Prevent flickering stop popup
-  const [markersReady, setMarkersReady] = useState(false); // Track if markers have rendered
+
+  // Proximity-based boarding detection: tracks consecutive times user is near each bus
+  // Format: { busId: consecutiveCount }
+  const proximityCountRef = useRef({});
+  const PROXIMITY_THRESHOLD_M = 30; // Must be within 30 meters
+  const PROXIMITY_CONSECUTIVE_NEEDED = 4; // Need 4 consecutive near readings to auto-board
+
+  // Auto-exit detection: tracks consecutive times user is far from the riding bus
+  const exitCountRef = useRef(0);
+  const AUTO_EXIT_THRESHOLD_M = 100; // Must be more than 100 meters away
+  const AUTO_EXIT_CONSECUTIVE_NEEDED = 4; // Need 4 consecutive far readings to auto-exit
+  const lastNetworkCheckRef = useRef(Date.now()); // Track when we last had good network
+
+  // Bus movement tracking: only auto-board if bus is moving
+  // Format: { busId: { lat, lon, timestamp } }
+  const prevBusPositionsRef = useRef({});
+  const BUS_MOVING_THRESHOLD_M = 5; // Bus must have moved at least 5 meters to be considered "moving"
 
   useEffect(() => {
     busesRef.current = buses;
@@ -228,7 +440,7 @@ const MapScreen = () => {
 
   // Memoize route segments for performance
   // Uses remainingRoute for real-time eating ONLY during simulation
-  // Otherwise uses stop-based calculation for better performance
+  // Otherwise uses effectiveStopIndex for stop-based calculation
   const routeSegments = useMemo(() => {
     if (!activeRoute?.waypoints) return { passed: [], upcoming: [], distant: [], routeColor: '#e11d48' };
 
@@ -240,13 +452,14 @@ const MapScreen = () => {
       .map((wp, idx) => ({ ...wp, waypointIndex: idx }))
       .filter(wp => wp.isStop && wp.stopName);
 
-    // Find stop waypoint indices for segment calculation
-    const currentStop = stopsWithIndices[currentStopIndex - 1];
+    // Use effectiveStopIndex for segment calculation (includes bus position calculation)
+    const currentStop = stopsWithIndices[effectiveStopIndex - 1];
     const currentWaypointIdx = currentStop ? currentStop.waypointIndex : 0;
 
-    const secondUpcomingStop = stopsWithIndices[currentStopIndex + 1];
-    const upcomingStopWaypointIdx = secondUpcomingStop
-      ? secondUpcomingStop.waypointIndex
+    // Show upcoming segment to next 2 stops (3 total visible ahead)
+    const upcomingStop = stopsWithIndices[Math.min(effectiveStopIndex + 2, stopsWithIndices.length - 1)];
+    const upcomingStopWaypointIdx = upcomingStop
+      ? upcomingStop.waypointIndex
       : fullWaypoints.length - 1;
 
     let passedSegment = [];
@@ -267,9 +480,14 @@ const MapScreen = () => {
       upcomingSegment = fullWaypoints.slice(currentWaypointIdx, upcomingStopWaypointIdx + 1);
       distantSegment = fullWaypoints.slice(upcomingStopWaypointIdx);
     }
-
-    return { passed: passedSegment, upcoming: upcomingSegment, distant: distantSegment, routeColor };
-  }, [activeRoute, simulationBus, remainingRoute, currentStopIndex]);
+    // PERFORMANCE: Apply polyline simplification to reduce point count
+    return {
+      passed: simplifyPolyline(passedSegment),
+      upcoming: simplifyPolyline(upcomingSegment),
+      distant: simplifyPolyline(distantSegment),
+      routeColor
+    };
+  }, [activeRoute, simulationBus, remainingRoute, effectiveStopIndex]);
 
   // Memoize stop markers data with loop detection
   // Hides distant stops that are geographically close to upcoming stops
@@ -284,7 +502,7 @@ const MapScreen = () => {
         index,
         stopNumber: index + 1,
         stopsAhead: index - effectiveStopIndex,
-        isUpcoming: (index - effectiveStopIndex) >= 0 && (index - effectiveStopIndex) < 2, // Only next 2 stops
+        isUpcoming: (index - effectiveStopIndex) >= 0 && (index - effectiveStopIndex) <= 2, // Current + next 2 stops (3 total)
         isPassed: (index - effectiveStopIndex) < 0,
         isHiddenByNearby: false, // Will be set below
       }));
@@ -314,8 +532,158 @@ const MapScreen = () => {
       }
     }
 
+    // Return all stops - simpler approach
+    // The rendering will handle visual differentiation (upcoming, passed, etc.)
     return allStops;
-  }, [activeRoute, effectiveStopIndex]);
+  }, [activeRoute, effectiveStopIndex, ridingBus, userStopIndex]);
+
+  // Memoize ALL stop markers from ALL routes for default display
+  // Only includes actual bus stops (isStop && stopName), not intermediate waypoints
+  const allStopMarkers = useMemo(() => {
+    const stops = [];
+    allRoutes.forEach(route => {
+      if (!route.waypoints) return;
+      // Only include waypoints that are actual bus stops
+      route.waypoints
+        .filter(wp => wp.isStop && wp.stopName)
+        .forEach((wp, idx) => {
+          stops.push({
+            ...wp,
+            routeId: route.routeId,
+            routeName: route.routeName,
+            routeColor: route.routeColor || '#2563eb',
+            stopNumber: idx + 1,
+            isHighlighted: route.routeId === highlightedRouteId,
+          });
+        });
+    });
+    return stops;
+  }, [allRoutes, highlightedRouteId]);
+
+  // PERFORMANCE: Viewport culling - only render visible markers with HARD LIMIT
+  const visibleStopMarkers = useMemo(() => {
+    const padding = 0.002; // Reduced padding to limit markers
+    const minLat = mapRegion.latitude - mapRegion.latitudeDelta - padding;
+    const maxLat = mapRegion.latitude + mapRegion.latitudeDelta + padding;
+    const minLon = mapRegion.longitude - mapRegion.longitudeDelta - padding;
+    const maxLon = mapRegion.longitude + mapRegion.longitudeDelta + padding;
+
+    const visible = allStopMarkers.filter(stop =>
+      stop.latitude >= minLat && stop.latitude <= maxLat &&
+      stop.longitude >= minLon && stop.longitude <= maxLon
+    );
+
+    // MEMORY FIX: Hard limit on BACKGROUND markers to prevent OOM crash
+    // NOTE: This only affects stops when NO route is selected
+    // When activeRoute is set, ALL its stops are shown separately (no limit)
+    const MARKER_LIMIT = 50;
+    if (visible.length > MARKER_LIMIT) {
+      const highlighted = visible.filter(s => s.isHighlighted);
+      const others = visible.filter(s => !s.isHighlighted).slice(0, MARKER_LIMIT - highlighted.length);
+      return [...highlighted, ...others];
+    }
+    return visible;
+  }, [allStopMarkers, mapRegion]);
+
+  // WAITING AT STOP: Detect if user is near a bus stop (within 50m)
+  const nearbyStop = useMemo(() => {
+    if (!effectiveUserLocation || allStopMarkers.length === 0) return null;
+
+    const NEARBY_THRESHOLD = 50; // 50 meters
+    let closestStop = null;
+    let closestDistance = Infinity;
+
+    for (const stop of allStopMarkers) {
+      const distance = getDistanceFromLatLonInM_Static(
+        effectiveUserLocation.latitude,
+        effectiveUserLocation.longitude,
+        stop.latitude,
+        stop.longitude
+      );
+      if (distance < NEARBY_THRESHOLD && distance < closestDistance) {
+        closestDistance = distance;
+        closestStop = { ...stop, distance };
+      }
+    }
+    return closestStop;
+  }, [effectiveUserLocation, allStopMarkers]);
+
+  // INCOMING BUSES: Calculate which buses are heading to the nearby stop
+  const incomingBuses = useMemo(() => {
+    if (!nearbyStop || buses.length === 0 || allRoutes.length === 0) return [];
+
+    const incoming = [];
+    const AVG_BUS_SPEED_MS = 25 * 1000 / 3600; // 25 km/h in m/s
+
+    for (const bus of buses) {
+      const busLat = bus.current_lat || bus.lat;
+      const busLon = bus.current_lon || bus.lon;
+      if (!busLat || !busLon) continue;
+
+      // Find if this bus is on a route that passes through the nearby stop
+      const stopRoute = allRoutes.find(r => r.routeId === nearbyStop.routeId);
+      if (!stopRoute || !stopRoute.waypoints) continue;
+
+      // Find the index of the nearby stop in this route
+      const stopIdx = stopRoute.waypoints.findIndex(wp =>
+        wp.isStop && wp.stopName === nearbyStop.stopName
+      );
+      if (stopIdx === -1) continue;
+
+      // Find bus position on this route (which segment is it closest to)
+      let busSegmentIdx = -1;
+      let minBusDist = Infinity;
+      for (let i = 0; i < stopRoute.waypoints.length - 1; i++) {
+        const wp = stopRoute.waypoints[i];
+        const dist = getDistanceFromLatLonInM_Static(busLat, busLon, wp.latitude, wp.longitude);
+        if (dist < minBusDist) {
+          minBusDist = dist;
+          busSegmentIdx = i;
+        }
+      }
+
+      // Only include if bus is BEFORE the stop (heading toward it)
+      if (busSegmentIdx >= stopIdx) continue; // Bus has passed the stop
+
+      // Calculate distance from bus to stop along the route
+      let routeDistance = 0;
+      for (let i = busSegmentIdx; i < stopIdx; i++) {
+        const wp1 = stopRoute.waypoints[i];
+        const wp2 = stopRoute.waypoints[i + 1];
+        routeDistance += getDistanceFromLatLonInM_Static(
+          wp1.latitude, wp1.longitude,
+          wp2.latitude, wp2.longitude
+        );
+      }
+
+      // Calculate ETA
+      const etaSeconds = routeDistance / AVG_BUS_SPEED_MS;
+      const etaMinutes = Math.round(etaSeconds / 60);
+
+      incoming.push({
+        bus,
+        routeName: stopRoute.routeName,
+        routeColor: stopRoute.routeColor || '#2563eb',
+        distanceM: Math.round(routeDistance),
+        etaMinutes: etaMinutes < 1 ? 1 : etaMinutes, // At least 1 minute
+        stopsAway: stopIdx - busSegmentIdx,
+      });
+    }
+
+    // Sort by ETA
+    incoming.sort((a, b) => a.etaMinutes - b.etaMinutes);
+    return incoming;
+  }, [nearbyStop, buses, allRoutes]);
+
+  // PERFORMANCE: Debounced region change handler
+  const handleRegionChange = (region) => {
+    if (regionDebounceRef.current) {
+      clearTimeout(regionDebounceRef.current);
+    }
+    regionDebounceRef.current = setTimeout(() => {
+      setMapRegion(region);
+    }, 200); // 200ms debounce
+  };
 
   const [mapLoadError, setMapLoadError] = useState(false);
 
@@ -352,11 +720,16 @@ const MapScreen = () => {
       setMarkersReady(false);
       const timer = setTimeout(() => setMarkersReady(true), 500);
       return () => clearTimeout(timer);
+    } else {
+      // When route is cleared, also reset markersReady so stops can re-render
+      setMarkersReady(false);
+      const timer = setTimeout(() => setMarkersReady(true), 300);
+      // Clear previous snap state when route changes
+      setSnappedLocation(null);
+      setSnappedBusId(null);
+      lastSnappedIndexRef.current = 0; // Reset index tracker
+      return () => clearTimeout(timer);
     }
-    // Clear previous snap state when route changes
-    setSnappedLocation(null);
-    setSnappedBusId(null);
-    lastSnappedIndexRef.current = 0; // Reset index tracker
   }, [activeRoute]);
 
   // Load user location and fetch initial data
@@ -369,6 +742,48 @@ const MapScreen = () => {
     const interval = setInterval(fetchBuses, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  // Load all routes on mount for displaying all stops
+  useEffect(() => {
+    const loadAllRoutes = async () => {
+      try {
+        const routes = await getAllRoutes();
+        setAllRoutes(routes);
+        // After routes load, allow markers to render initially, then disable tracking
+        setMarkersReady(false);
+        setTimeout(() => setMarkersReady(true), 800);
+      } catch (error) {
+        console.log('Error loading all routes:', error);
+      }
+    };
+    loadAllRoutes();
+  }, []);
+
+  // Set highlighted route when selectedRoute changes (from Routes screen)
+  useEffect(() => {
+    if (selectedRoute?.routeId) {
+      setHighlightedRouteId(selectedRoute.routeId);
+    }
+  }, [selectedRoute]);
+
+  // Zoom to bus when focusBus is provided (from Routes screen bus card)
+  useEffect(() => {
+    if (focusBus && mapRef.current) {
+      const busLat = focusBus.current_lat || focusBus.lat;
+      const busLon = focusBus.current_lon || focusBus.lon;
+      if (busLat && busLon) {
+        // Small delay to ensure map is ready
+        setTimeout(() => {
+          mapRef.current?.animateToRegion({
+            latitude: busLat,
+            longitude: busLon,
+            latitudeDelta: 0.008,
+            longitudeDelta: 0.008,
+          }, 500);
+        }, 300);
+      }
+    }
+  }, [focusBus]);
 
   const connectMqtt = async () => {
     if (Platform.OS !== 'web') {
@@ -570,29 +985,175 @@ const MapScreen = () => {
   }, [buses]);
 
   // --- AUTO-EXIT LOGIC ---
-  // If user moves far from the bus, assume they got off and exit Riding Mode
-  // Uses effectiveUserLocation to work with debug location override
+  // If user moves far from the bus for multiple consecutive readings, assume they got off
+  // Only counts when we have fresh bus location data (indicates good network)
   useEffect(() => {
     const currentUserLoc = effectiveUserLocation;
-    if (ridingBus && currentUserLoc && ridingBus.current_lat) {
-      // Find current position of the riding bus (streaming updates)
-      const currentBus = buses.find(b => b.id === ridingBus.id || b.bus_mac === ridingBus.bus_mac);
-      if (currentBus) {
-        const dist = getDistanceFromLatLonInM_Static(
-          currentUserLoc.latitude, currentUserLoc.longitude,
-          currentBus.current_lat, currentBus.current_lon
-        );
+    if (!ridingBus || !currentUserLoc) {
+      return;
+    }
 
-        // Threshold: 100 meters (disable in debug mode with fake location to allow testing)
-        if (dist > 100 && !debugLocationEnabled) {
-          console.log(`[AutoExit] Distance ${dist}m > 100m. Exiting bus mode.`);
-          setRidingBus(null);
-          setBusSignal(null);
-          Alert.alert("Auto-Exit", "You have moved away from the bus.");
-        }
+    // Disable auto-exit when using debug fake location (for testing)
+    if (debugLocationEnabled) {
+      return;
+    }
+
+    // Find current position of the riding bus (streaming updates)
+    const currentBus = buses.find(b => b.id === ridingBus.id || b.bus_mac === ridingBus.bus_mac);
+    if (!currentBus || !currentBus.current_lat) {
+      // Bus not found or no location - don't count (might be network issue)
+      return;
+    }
+
+    // Check if bus location is fresh (updated within last 10 seconds)
+    // This indicates we have good network connectivity
+    const now = Date.now();
+    const busLastUpdate = currentBus.lastUpdate || currentBus.updated_at;
+    const isBusLocationFresh = busLastUpdate
+      ? (now - new Date(busLastUpdate).getTime()) < 10000
+      : true; // Assume fresh if no timestamp (conservative)
+
+    if (!isBusLocationFresh) {
+      console.log('[AutoExit] Bus location stale, skipping count (possible network issue)');
+      return;
+    }
+
+    const dist = getDistanceFromLatLonInM_Static(
+      currentUserLoc.latitude, currentUserLoc.longitude,
+      currentBus.current_lat, currentBus.current_lon
+    );
+
+    if (dist > AUTO_EXIT_THRESHOLD_M) {
+      // User is far from bus, increment count
+      exitCountRef.current += 1;
+      console.log(`[AutoExit] Far from bus: ${exitCountRef.current}/${AUTO_EXIT_CONSECUTIVE_NEEDED} (${dist.toFixed(0)}m)`);
+
+      if (exitCountRef.current >= AUTO_EXIT_CONSECUTIVE_NEEDED) {
+        console.log(`[AutoExit] ✅ ${AUTO_EXIT_CONSECUTIVE_NEEDED} consecutive far readings. Exiting bus mode.`);
+        setRidingBus(null);
+        setBusSignal(null);
+        exitCountRef.current = 0; // Reset for next time
+        Alert.alert("Auto-Exit", "You have moved away from the bus.");
+      }
+    } else {
+      // User is close to bus, reset count
+      if (exitCountRef.current > 0) {
+        console.log('[AutoExit] Back near bus, resetting count');
+        exitCountRef.current = 0;
       }
     }
   }, [effectiveUserLocation, buses, ridingBus, debugLocationEnabled]);
+
+  // --- PROXIMITY-BASED AUTO-BOARDING DETECTION ---
+  // Automatically detect when user is riding a bus by tracking consecutive near readings
+  useEffect(() => {
+    const currentUserLoc = effectiveUserLocation;
+
+    // Skip if already riding a bus or no location
+    if (ridingBus || !currentUserLoc) {
+      return;
+    }
+
+    // Get buses to check (including fake bus if enabled)
+    const busesToCheck = fakeBusEnabled && fakeBusLocation
+      ? [...buses, {
+        id: 'FAKE-BUS-TEST',
+        bus_mac: 'FAKE-BUS-TEST',
+        bus_name: '🧪 Fake Test Bus',
+        current_lat: fakeBusLocation.latitude,
+        current_lon: fakeBusLocation.longitude,
+        isFake: true,
+      }]
+      : buses;
+
+    if (busesToCheck.length === 0) return;
+
+    // Check distance to each bus
+    const newCounts = { ...proximityCountRef.current };
+    let boardedBus = null;
+
+    busesToCheck.forEach(bus => {
+      if (!bus.current_lat || !bus.current_lon) return;
+
+      const busId = bus.id || bus.bus_mac;
+
+      // Check if bus is moving (skip for fake bus - always allow for testing)
+      const prevPos = prevBusPositionsRef.current[busId];
+      const now = Date.now();
+      let isBusMoving = bus.isFake; // Fake buses are always "moving" for testing
+
+      if (!bus.isFake && prevPos) {
+        const busMoveDistance = getDistanceFromLatLonInM_Static(
+          prevPos.lat, prevPos.lon,
+          bus.current_lat, bus.current_lon
+        );
+        isBusMoving = busMoveDistance >= BUS_MOVING_THRESHOLD_M;
+
+        if (!isBusMoving && newCounts[busId]) {
+          console.log(`[ProximityBoarding] Bus ${busId} is stationary, not counting`);
+        }
+      }
+
+      // Update previous position
+      prevBusPositionsRef.current[busId] = {
+        lat: bus.current_lat,
+        lon: bus.current_lon,
+        timestamp: now,
+      };
+
+      const dist = getDistanceFromLatLonInM_Static(
+        currentUserLoc.latitude, currentUserLoc.longitude,
+        bus.current_lat, bus.current_lon
+      );
+
+      if (dist <= PROXIMITY_THRESHOLD_M && isBusMoving) {
+        // User is near this moving bus, increment count
+        newCounts[busId] = (newCounts[busId] || 0) + 1;
+        console.log(`[ProximityBoarding] Near moving bus ${busId}: ${newCounts[busId]}/${PROXIMITY_CONSECUTIVE_NEEDED} (${dist.toFixed(0)}m)`);
+
+        // Check if threshold reached
+        if (newCounts[busId] >= PROXIMITY_CONSECUTIVE_NEEDED && !boardedBus) {
+          boardedBus = bus;
+        }
+      } else if (dist > PROXIMITY_THRESHOLD_M) {
+        // User moved away from this bus, reset count
+        if (newCounts[busId]) {
+          console.log(`[ProximityBoarding] Moved away from bus ${busId}, resetting count`);
+          delete newCounts[busId];
+        }
+      }
+      // Note: if near but bus not moving, we just don't increment (keep existing count)
+    });
+
+    proximityCountRef.current = newCounts;
+
+    // Auto-board if threshold reached
+    if (boardedBus) {
+      const busId = boardedBus.id || boardedBus.bus_mac;
+      console.log(`[ProximityBoarding] ✅ Auto-boarding bus ${busId}!`);
+      setRidingBus(boardedBus);
+
+      // Try to load the bus's assigned route
+      (async () => {
+        try {
+          const routeId = await getRouteIdForBus(busId);
+          if (routeId) {
+            const route = await loadRoute(routeId);
+            if (route) {
+              console.log(`[ProximityBoarding] Loaded route: ${route.routeName}`);
+              setBusSelectedRoute(route);
+              setRemainingRoute(route.waypoints || []);
+            }
+          }
+        } catch (err) {
+          console.log('[ProximityBoarding] Could not load route:', err.message);
+        }
+      })();
+
+      // Reset all counts after boarding
+      proximityCountRef.current = {};
+    }
+  }, [effectiveUserLocation, buses, ridingBus, fakeBusEnabled, fakeBusLocation]);
 
   useFocusEffect(
     React.useCallback(() => {
@@ -742,6 +1303,41 @@ const MapScreen = () => {
     setDebugLocation(e.nativeEvent.coordinate);
   };
 
+  // Enable fake bus for testing proximity boarding
+  const enableFakeBus = () => {
+    // Place fake bus near user's location (or center of SUT if no location)
+    const baseLoc = userLocation || { latitude: 14.8820, longitude: 102.0207 };
+    const fakeBusLoc = {
+      latitude: baseLoc.latitude + 0.0002, // Slightly offset (~20m)
+      longitude: baseLoc.longitude + 0.0002,
+    };
+    setFakeBusLocation(fakeBusLoc);
+    setFakeBusEnabled(true);
+  };
+
+  // Handle dragging the fake bus marker
+  const handleFakeBusMarkerDrag = (e) => {
+    setFakeBusLocation(e.nativeEvent.coordinate);
+  };
+
+  // Merge fake bus into buses array for proximity detection
+  const effectiveBuses = useMemo(() => {
+    if (!fakeBusEnabled || !fakeBusLocation) return buses;
+
+    const fakeBus = {
+      id: 'FAKE-BUS-TEST',
+      bus_mac: 'FAKE-BUS-TEST',
+      bus_name: '🧪 Fake Test Bus',
+      current_lat: fakeBusLocation.latitude,
+      current_lon: fakeBusLocation.longitude,
+      seats_available: 30,
+      pm2_5: 12,
+      isFake: true, // Mark as fake for special handling
+    };
+
+    return [...buses, fakeBus];
+  }, [buses, fakeBusEnabled, fakeBusLocation]);
+
   const getAirQualityStatus = (value) => {
     if (value == null) return { status: 'No Data', color: 'gray' };
     if (value <= 25) return { status: 'Good', color: 'rgba(0, 255, 0, 0.4)', solidColor: 'green' };
@@ -753,7 +1349,24 @@ const MapScreen = () => {
   const handleMapPress = (e) => {
     if (pathMode) {
       setWaypoints([...waypoints, e.nativeEvent.coordinate]);
+    } else if (!ridingBus) {
+      // Only clear highlights when NOT riding a bus
+      // When riding, keep the route tracking active
+      // Check activeRoute directly for more reliable detection
+      if (activeRoute || busSelectedRoute || waypoints.length > 0 || selectedRoute) {
+        setBusSelectedRoute(null);
+        setHighlightedRouteId(null);
+        setRemainingRoute([]);
+        setWaypoints([]); // Clear waypoints to prevent orange markers from showing
+
+        // Also clear selectedRoute from navigation params
+        // This ensures activeRoute becomes null so stops/lines fade to dimmed state
+        if (selectedRoute) {
+          navigation.setParams({ selectedRoute: null, focusBus: null });
+        }
+      }
     }
+    // If ridingBus is set, do nothing - keep route tracking
   };
 
   // Handle bus marker press - load and display assigned route
@@ -762,17 +1375,24 @@ const MapScreen = () => {
     console.log('[BusPress] Tapped bus:', busMac);
 
     try {
-      const routeId = await getRouteIdForBus(busMac);
+      let routeId = await getRouteIdForBus(busMac);
       console.log('[BusPress] Assigned route ID:', routeId);
+
+      // For fake bus, use the first available route if none assigned
+      if (!routeId && bus.isFake && allRoutes.length > 0) {
+        routeId = allRoutes[0].routeId;
+        console.log('[BusPress] Fake bus - using first available route:', routeId);
+      }
 
       if (routeId) {
         const route = await loadRoute(routeId);
         if (route) {
           console.log('[BusPress] Loaded route:', route.routeName);
           setBusSelectedRoute(route);
+          setHighlightedRouteId(route.routeId); // Highlight this route's stops
           setRemainingRoute(route.waypoints || []);
-          // Also set ridingBus for potential ring functionality
-          setRidingBus(bus);
+          // NOTE: Don't set ridingBus here - that's only for actually riding
+          // User is just viewing the route, not riding the bus
         } else {
           console.log('[BusPress] Route not found in storage');
           Alert.alert('Route Not Found', 'The assigned route could not be loaded.');
@@ -781,6 +1401,7 @@ const MapScreen = () => {
         console.log('[BusPress] No route assigned to this bus');
         // Clear previous route if tapping unassigned bus
         setBusSelectedRoute(null);
+        setHighlightedRouteId(null); // Clear highlight
         setRemainingRoute([]);
       }
     } catch (error) {
@@ -1050,12 +1671,13 @@ const MapScreen = () => {
         style={styles.map}
         initialRegion={SUT_COORDINATES}
         onPress={handleMapPress}
-        showsUserLocation={true}
+        onRegionChangeComplete={handleRegionChange}
+        showsUserLocation={!(debugMode && debugLocationEnabled)}
         showsMyLocationButton={false}
         customMapStyle={mapStyle}
         userInterfaceStyle={isDark ? 'dark' : 'light'}
       >
-        {buses.map((bus, i) => {
+        {busesWithFake.map((bus, i) => {
           // ... (Existing Bus Rendering Code)
           // Use snapped location if this is the active bus and we have one
           const busMac = bus.bus_mac || bus.mac_address || bus.id;
@@ -1085,6 +1707,13 @@ const MapScreen = () => {
           }
           const description = `Passengers: ${occupied}/33`;
 
+          // Highlight the bus that belongs to the selected/highlighted route
+          const isHighlightedBus = highlightedRouteId && (
+            targetBusId === busMac || isLinkedRouteBus
+          );
+          const busScale = isHighlightedBus ? 1.3 : 1.0;
+          const busZIndex = isHighlightedBus ? 1000 : 100;
+
           return (
             <Marker.Animated
               key={`bus-${i}-${bus.id || bus.bus_mac}`}
@@ -1092,8 +1721,21 @@ const MapScreen = () => {
               title={bus.bus_name || "Bus"}
               description={description}
               onPress={() => handleBusPress(bus)}
+              zIndex={busZIndex}
             >
-              <Image source={busIcon} style={{ width: 40, height: 40 }} resizeMode="contain" />
+              <View style={isHighlightedBus ? {
+                shadowColor: selectedRoute?.routeColor || '#2563eb',
+                shadowOffset: { width: 0, height: 0 },
+                shadowOpacity: 0.8,
+                shadowRadius: 10,
+                elevation: 10,
+              } : null}>
+                <Image
+                  source={busIcon}
+                  style={{ width: 40 * busScale, height: 40 * busScale }}
+                  resizeMode="contain"
+                />
+              </View>
             </Marker.Animated>
           );
         })}
@@ -1108,6 +1750,28 @@ const MapScreen = () => {
             strokeWidth={3}
           />
         ))}
+
+        {/* Render ALL route lines from saved routes (dimmed by default) */}
+        {/* The highlighted/selected route will be rendered with thicker line above */}
+        {allRoutes.map(route => {
+          // Skip if this route is the active/highlighted route (rendered with more detail below)
+          if (activeRoute && route.routeId === activeRoute.routeId) {
+            return null;
+          }
+          if (!route.waypoints || route.waypoints.length < 2) return null;
+
+          const routeColor = route.routeColor || '#2563eb';
+
+          return (
+            <Polyline
+              key={`all-route-${route.routeId}`}
+              coordinates={route.waypoints}
+              strokeColor={routeColor + '40'} // 25% opacity for dimmed routes
+              strokeWidth={3}
+              zIndex={5}
+            />
+          );
+        })}
 
         {/* Render Selected Route with 3 Segments in Draw Order (last = on top) */}
         {activeRoute && (
@@ -1145,6 +1809,63 @@ const MapScreen = () => {
           </>
         )}
 
+        {/* Render VISIBLE bus stops from ALL routes (viewport culling) */}
+        {/* Only renders markers in current map bounds */}
+        {visibleStopMarkers.map((stop, idx) => {
+          const isFromHighlightedRoute = stop.isHighlighted;
+          // When activeRoute is set, its stops are rendered with more detail below
+          // So we can skip rendering them here to avoid duplicates
+          // But always render stops from other routes
+          if (activeRoute && stop.routeId === activeRoute.routeId) {
+            return null;
+          }
+
+          const markerOpacity = isFromHighlightedRoute ? 1.0 : 0.8; // Show more visible on startup
+          const markerSize = isFromHighlightedRoute ? 24 : 20; // Slightly larger default
+          const zIndex = isFromHighlightedRoute ? 90 : 10;
+          const routeColor = stop.routeColor || '#2563eb';
+
+          return (
+            <Marker
+              key={`all-stop-${stop.routeId}-${idx}`}
+              coordinate={{ latitude: stop.latitude, longitude: stop.longitude }}
+              anchor={{ x: 0.5, y: 0.5 }}
+              opacity={markerOpacity}
+              zIndex={zIndex}
+              tracksViewChanges={!markersReady}
+              title={`🚏 ${stop.stopName}`}
+              description={stop.routeName}
+            >
+              {/* Restored: Stop marker with number */}
+              <View style={{ alignItems: 'center', justifyContent: 'center' }}>
+                <View style={{
+                  width: markerSize,
+                  height: markerSize,
+                  borderRadius: markerSize / 2,
+                  backgroundColor: routeColor,
+                  borderWidth: 2,
+                  borderColor: 'white',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  shadowColor: '#000',
+                  shadowOffset: { width: 0, height: 1 },
+                  shadowOpacity: 0.2,
+                  shadowRadius: 1,
+                  elevation: 2,
+                }}>
+                  <Text style={{
+                    color: 'white',
+                    fontWeight: 'bold',
+                    fontSize: markerSize * 0.4
+                  }}>
+                    {stop.stopNumber}
+                  </Text>
+                </View>
+              </View>
+            </Marker>
+          );
+        })}
+
         {/* Render Stop Stations from Selected Route with Dynamic Opacity (Memoized) */}
         {activeRoute && stopMarkers.map((stop) => {
           const stopName = stop.stopName || `Stop ${stop.stopNumber}`;
@@ -1181,14 +1902,14 @@ const MapScreen = () => {
               title={`🚏 Stop #${stop.stopNumber}`}
               description={stopName}
             >
-              {/* Custom Stop Marker */}
+              {/* Restored: Stop marker with number */}
               <View style={{ alignItems: 'center', justifyContent: 'center' }}>
                 <View style={{
                   width: markerSize,
                   height: markerSize,
                   borderRadius: markerSize / 2,
                   backgroundColor: stop.isPassed ? '#999' : routeColor,
-                  borderWidth: 2,
+                  borderWidth: stop.isUpcoming ? 3 : 2,
                   borderColor: 'white',
                   alignItems: 'center',
                   justifyContent: 'center',
@@ -1198,7 +1919,6 @@ const MapScreen = () => {
                   shadowRadius: 2,
                   elevation: 3,
                 }}>
-                  {/* Show actual stop number (1 to N) */}
                   <Text style={{
                     color: 'white',
                     fontWeight: 'bold',
@@ -1267,8 +1987,8 @@ const MapScreen = () => {
           </Marker.Animated>
         )}
 
-        {/* Draggable Markers - Only for path drawing mode, hide when route selected */}
-        {!selectedRoute && waypoints.map((wp, index) => (
+        {/* Draggable Markers - Only for path drawing mode, hide when any route is selected */}
+        {!selectedRoute && !busSelectedRoute && waypoints.map((wp, index) => (
           <Marker
             key={`wp-${index}-${wp.latitude}-${wp.longitude}`}
             coordinate={wp}
@@ -1326,6 +2046,36 @@ const MapScreen = () => {
             </View>
           </Marker>
         )}
+
+        {/* Fake Bus Marker - Draggable fake bus for testing proximity boarding */}
+        {debugMode && fakeBusEnabled && fakeBusLocation && (
+          <Marker
+            coordinate={fakeBusLocation}
+            title="🧪 Fake Test Bus"
+            description="Drag to test proximity boarding"
+            draggable
+            onDragEnd={handleFakeBusMarkerDrag}
+            anchor={{ x: 0.5, y: 0.5 }}
+          >
+            <View style={{
+              backgroundColor: '#f97316',
+              width: 44,
+              height: 44,
+              borderRadius: 22,
+              borderWidth: 3,
+              borderColor: 'white',
+              justifyContent: 'center',
+              alignItems: 'center',
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.3,
+              shadowRadius: 3,
+              elevation: 5,
+            }}>
+              <Ionicons name="bus" size={24} color="white" />
+            </View>
+          </Marker>
+        )}
       </MapView>
 
       {showGrid && <GridOverlay />}
@@ -1338,9 +2088,10 @@ const MapScreen = () => {
               <Text style={styles.debugText}>🛠 Debug</Text>
             </TouchableOpacity>
           ) : (
-            <View style={[styles.controlPanel, { maxHeight: 300 }]}>
+            <View style={[styles.controlPanel, { maxHeight: 350 }]}>
+              {/* Header with close button */}
               <View style={styles.panelHeader}>
-                <Text style={styles.panelTitle}>Simulation Controls</Text>
+                <Text style={styles.panelTitle}>🛠 Debug Tools</Text>
                 <TouchableOpacity onPress={() => setShowGrid(!showGrid)} style={{ marginRight: 10 }}>
                   <Text style={{ fontSize: 20 }}>#️⃣</Text>
                 </TouchableOpacity>
@@ -1349,108 +2100,172 @@ const MapScreen = () => {
                 </TouchableOpacity>
               </View>
 
-              <TouchableOpacity
-                style={[styles.actionBtn, { backgroundColor: '#10b981' }]}
-                onPress={simulateRoute}
-              >
-                <Text style={styles.actionBtnText}>▶ Test Animation</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.actionBtn, { backgroundColor: '#ef4444', marginTop: 10 }]}
-                onPress={stopAnimation}
-              >
-                <Text style={styles.actionBtnText}>⏹ Stop</Text>
-              </TouchableOpacity>
-
-              {/* Speed Control */}
-              <View style={{ marginTop: 15 }}>
-                <Text style={{ fontSize: 12, color: '#666', marginBottom: 5 }}>Speed: {simulationSpeed} m/s (~{Math.round(simulationSpeed * 3.6)} km/h)</Text>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                  <TouchableOpacity
-                    style={[styles.speedBtn, simulationSpeed === 10 && styles.speedBtnActive]}
-                    onPress={() => { setSimulationSpeed(10); simulationSpeedRef.current = 10; }}
-                  >
-                    <Text style={styles.speedBtnText}>🐢 Slow</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.speedBtn, simulationSpeed === 20 && styles.speedBtnActive]}
-                    onPress={() => { setSimulationSpeed(20); simulationSpeedRef.current = 20; }}
-                  >
-                    <Text style={styles.speedBtnText}>🚌 Normal</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.speedBtn, simulationSpeed === 50 && styles.speedBtnActive]}
-                    onPress={() => { setSimulationSpeed(50); simulationSpeedRef.current = 50; }}
-                  >
-                    <Text style={styles.speedBtnText}>🚀 Fast</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              <View style={{ marginTop: 10, borderTopWidth: 1, borderColor: '#eee', paddingTop: 5 }}>
-                <TouchableOpacity onPress={() => setWaypoints([])}>
-                  <Text style={{ color: 'red', fontSize: 12 }}>Clear Path</Text>
-                </TouchableOpacity>
-              </View>
-
-              {/* Debug Location Override Toggle */}
-              <View style={{ marginTop: 10, borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
-                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>📍 Fake Location</Text>
+              {/* Tab Buttons */}
+              <View style={{ flexDirection: 'row', marginBottom: 10, borderRadius: 8, overflow: 'hidden' }}>
                 <TouchableOpacity
-                  style={[styles.actionBtn, { backgroundColor: debugLocationEnabled ? '#3b82f6' : '#9ca3af' }]}
-                  onPress={() => {
-                    if (debugLocationEnabled) {
-                      setDebugLocationEnabled(false);
-                    } else {
-                      enableDebugLocation();
-                    }
+                  style={{
+                    flex: 1,
+                    padding: 8,
+                    backgroundColor: debugTab === 'simulation' ? '#3b82f6' : '#e5e7eb',
+                    alignItems: 'center',
                   }}
+                  onPress={() => setDebugTab('simulation')}
                 >
-                  <Text style={styles.actionBtnText}>
-                    {debugLocationEnabled ? '📍 Location Override ON' : '📍 Enable Fake Location'}
+                  <Text style={{ color: debugTab === 'simulation' ? 'white' : '#666', fontWeight: 'bold', fontSize: 12 }}>
+                    🎬 Simulation
                   </Text>
                 </TouchableOpacity>
-                {debugLocationEnabled && debugLocation && (
-                  <Text style={{ fontSize: 10, color: '#666', marginTop: 5 }}>
-                    Drag the blue marker to move your position
+                <TouchableOpacity
+                  style={{
+                    flex: 1,
+                    padding: 8,
+                    backgroundColor: debugTab === 'testing' ? '#3b82f6' : '#e5e7eb',
+                    alignItems: 'center',
+                  }}
+                  onPress={() => setDebugTab('testing')}
+                >
+                  <Text style={{ color: debugTab === 'testing' ? 'white' : '#666', fontWeight: 'bold', fontSize: 12 }}>
+                    🧪 Testing
                   </Text>
-                )}
+                </TouchableOpacity>
               </View>
 
-              {/* Force Ride Bus Debug Button */}
-              <View style={{ marginTop: 10, borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
-                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>🚌 Riding Card Test</Text>
-                {ridingBus ? (
+              {/* Simulation Tab */}
+              {debugTab === 'simulation' && (
+                <ScrollView style={{ maxHeight: 200 }}>
                   <TouchableOpacity
-                    style={[styles.actionBtn, { backgroundColor: '#ef4444' }]}
-                    onPress={() => {
-                      setRidingBus(null);
-                      setBusSignal(null);
-                    }}
+                    style={[styles.actionBtn, { backgroundColor: '#10b981' }]}
+                    onPress={simulateRoute}
                   >
-                    <Text style={styles.actionBtnText}>🚫 Exit Riding Mode</Text>
+                    <Text style={styles.actionBtnText}>▶ Test Animation</Text>
                   </TouchableOpacity>
-                ) : (
+
                   <TouchableOpacity
-                    style={[styles.actionBtn, { backgroundColor: '#8b5cf6' }]}
-                    onPress={() => {
-                      if (buses.length > 0) {
-                        const testBus = buses[0];
-                        setRidingBus(testBus);
-                        setBusSignal(-55); // Mock signal
-                        // Also load the bus route if available
-                        handleBusPress(testBus);
-                        Alert.alert('Debug', `Now riding: ${testBus.bus_name || testBus.bus_mac}`);
-                      } else {
-                        Alert.alert('No Buses', 'No buses available. Make sure the server is running.');
-                      }
-                    }}
+                    style={[styles.actionBtn, { backgroundColor: '#ef4444', marginTop: 10 }]}
+                    onPress={stopAnimation}
                   >
-                    <Text style={styles.actionBtnText}>🚌 Force Ride First Bus</Text>
+                    <Text style={styles.actionBtnText}>⏹ Stop</Text>
                   </TouchableOpacity>
-                )}
-              </View>
+
+                  {/* Speed Control */}
+                  <View style={{ marginTop: 15 }}>
+                    <Text style={{ fontSize: 12, color: '#666', marginBottom: 5 }}>Speed: {simulationSpeed} m/s (~{Math.round(simulationSpeed * 3.6)} km/h)</Text>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                      <TouchableOpacity
+                        style={[styles.speedBtn, simulationSpeed === 10 && styles.speedBtnActive]}
+                        onPress={() => { setSimulationSpeed(10); simulationSpeedRef.current = 10; }}
+                      >
+                        <Text style={styles.speedBtnText}>🐢 Slow</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.speedBtn, simulationSpeed === 20 && styles.speedBtnActive]}
+                        onPress={() => { setSimulationSpeed(20); simulationSpeedRef.current = 20; }}
+                      >
+                        <Text style={styles.speedBtnText}>🚌 Normal</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.speedBtn, simulationSpeed === 50 && styles.speedBtnActive]}
+                        onPress={() => { setSimulationSpeed(50); simulationSpeedRef.current = 50; }}
+                      >
+                        <Text style={styles.speedBtnText}>🚀 Fast</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  <View style={{ marginTop: 10, borderTopWidth: 1, borderColor: '#eee', paddingTop: 5 }}>
+                    <TouchableOpacity onPress={() => setWaypoints([])}>
+                      <Text style={{ color: 'red', fontSize: 12 }}>Clear Path</Text>
+                    </TouchableOpacity>
+                  </View>
+                </ScrollView>
+              )}
+
+              {/* Testing Tab */}
+              {debugTab === 'testing' && (
+                <ScrollView style={{ maxHeight: 200 }}>
+                  {/* Fake User Location */}
+                  <View style={{ marginBottom: 15 }}>
+                    <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>📍 Fake User Location</Text>
+                    <TouchableOpacity
+                      style={[styles.actionBtn, { backgroundColor: debugLocationEnabled ? '#3b82f6' : '#9ca3af' }]}
+                      onPress={() => {
+                        if (debugLocationEnabled) {
+                          setDebugLocationEnabled(false);
+                        } else {
+                          enableDebugLocation();
+                        }
+                      }}
+                    >
+                      <Text style={styles.actionBtnText}>
+                        {debugLocationEnabled ? '📍 Fake Location ON' : '📍 Enable Fake Location'}
+                      </Text>
+                    </TouchableOpacity>
+                    {debugLocationEnabled && (
+                      <Text style={{ fontSize: 10, color: '#666', marginTop: 5 }}>
+                        Drag the blue person marker on map
+                      </Text>
+                    )}
+                  </View>
+
+                  {/* Fake Bus */}
+                  <View style={{ marginBottom: 15, borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
+                    <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>🚌 Fake Bus</Text>
+                    <TouchableOpacity
+                      style={[styles.actionBtn, { backgroundColor: fakeBusEnabled ? '#f97316' : '#9ca3af' }]}
+                      onPress={() => {
+                        if (fakeBusEnabled) {
+                          setFakeBusEnabled(false);
+                          setFakeBusLocation(null);
+                        } else {
+                          enableFakeBus();
+                        }
+                      }}
+                    >
+                      <Text style={styles.actionBtnText}>
+                        {fakeBusEnabled ? '🚌 Fake Bus ON' : '🚌 Enable Fake Bus'}
+                      </Text>
+                    </TouchableOpacity>
+                    {fakeBusEnabled && (
+                      <Text style={{ fontSize: 10, color: '#666', marginTop: 5 }}>
+                        Drag the orange bus marker to test proximity boarding
+                      </Text>
+                    )}
+                  </View>
+
+                  {/* Force Ride Mode */}
+                  <View style={{ borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
+                    <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>🎫 Riding Card</Text>
+                    {ridingBus ? (
+                      <TouchableOpacity
+                        style={[styles.actionBtn, { backgroundColor: '#ef4444' }]}
+                        onPress={() => {
+                          setRidingBus(null);
+                          setBusSignal(null);
+                        }}
+                      >
+                        <Text style={styles.actionBtnText}>🚫 Exit Riding Mode</Text>
+                      </TouchableOpacity>
+                    ) : (
+                      <TouchableOpacity
+                        style={[styles.actionBtn, { backgroundColor: '#8b5cf6' }]}
+                        onPress={() => {
+                          if (buses.length > 0) {
+                            const testBus = buses[0];
+                            setRidingBus(testBus);
+                            setBusSignal(-55);
+                            handleBusPress(testBus);
+                            Alert.alert('Debug', `Now riding: ${testBus.bus_name || testBus.bus_mac}`);
+                          } else {
+                            Alert.alert('No Buses', 'No buses available. Make sure the server is running.');
+                          }
+                        }}
+                      >
+                        <Text style={styles.actionBtnText}>🚌 Force Ride First Bus</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                </ScrollView>
+              )}
             </View>
           )}
         </View>
@@ -1476,6 +2291,115 @@ const MapScreen = () => {
         </View>
       )}
 
+      {/* WAITING AT STOP CARD - Same design as riding card */}
+      {!ridingBus && nearbyStop && (() => {
+        const nextBus = incomingBuses[0];
+        const routeColor = nearbyStop.routeColor || '#e11d48';
+
+        return (
+          <TouchableOpacity
+            style={styles.ridingCard}
+            activeOpacity={0.9}
+            onPress={() => {
+              // Zoom to stop location when card is pressed
+              if (nearbyStop && mapRef.current) {
+                mapRef.current.animateToRegion({
+                  latitude: nearbyStop.latitude,
+                  longitude: nearbyStop.longitude,
+                  latitudeDelta: 0.005,
+                  longitudeDelta: 0.005,
+                }, 500);
+              }
+            }}
+          >
+            {/* Header: Stop Info */}
+            <View style={styles.ridingHeader}>
+              <View>
+                <Text style={styles.ridingTitle}>{nearbyStop.stopName}</Text>
+                <Text style={styles.ridingSubtitle}>
+                  {nearbyStop.routeName}
+                </Text>
+              </View>
+
+              {/* Distance Badge */}
+              <View style={styles.signalContainer}>
+                <View style={{ alignItems: 'flex-end' }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <Ionicons name="location" size={20} color={routeColor} />
+                    <Text style={{ fontSize: 14, color: routeColor, marginLeft: 4, fontWeight: 'bold' }}>
+                      {Math.round(nearbyStop.distance)}m
+                    </Text>
+                  </View>
+                  <Text style={{ fontSize: 10, color: '#9ca3af' }}>from you</Text>
+                </View>
+              </View>
+            </View>
+
+            {/* Info Grid: Next Bus, ETA, Stops Away */}
+            <View style={styles.ridingInfoGrid}>
+              {nextBus ? (
+                <>
+                  {/* Next Bus */}
+                  <View style={[styles.infoItem, { flex: 2, borderRightWidth: 1, borderColor: '#eee' }]}>
+                    <Text style={styles.infoLabel}>NEXT BUS</Text>
+                    <Text style={styles.infoValue} numberOfLines={1}>
+                      {nextBus.bus.bus_name || `Bus ${nextBus.bus.id?.slice(-4)}`}
+                    </Text>
+                  </View>
+
+                  {/* ETA */}
+                  <View style={[styles.infoItem, { flex: 1, alignItems: 'center', borderRightWidth: 1, borderColor: '#eee' }]}>
+                    <Text style={styles.infoLabel}>ETA</Text>
+                    <Text style={[styles.infoValue, { color: '#e11d48' }]}>
+                      {nextBus.etaMinutes} min
+                    </Text>
+                  </View>
+
+                  {/* Stops Away */}
+                  <View style={[styles.infoItem, { flex: 1, alignItems: 'flex-end' }]}>
+                    <Text style={styles.infoLabel}>STOPS</Text>
+                    <Text style={styles.infoValue}>
+                      {nextBus.stopsAway}
+                    </Text>
+                  </View>
+                </>
+              ) : (
+                <View style={[styles.infoItem, { flex: 1, alignItems: 'center' }]}>
+                  <Text style={styles.infoLabel}>NO INCOMING BUSES</Text>
+                  <Text style={[styles.infoValue, { fontSize: 12, color: '#9ca3af' }]}>
+                    Buses will appear here
+                  </Text>
+                </View>
+              )}
+            </View>
+
+            {/* More Buses List (if any) */}
+            {incomingBuses.length > 1 && (
+              <View style={{ paddingTop: 8, borderTopWidth: 1, borderColor: '#eee' }}>
+                <Text style={{ fontSize: 10, color: '#9ca3af', marginBottom: 4 }}>MORE BUSES</Text>
+                {incomingBuses.slice(1, 3).map((item, idx) => (
+                  <View
+                    key={`more-bus-${idx}`}
+                    style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 4 }}
+                  >
+                    <View style={{
+                      width: 6, height: 6, borderRadius: 3,
+                      backgroundColor: item.routeColor, marginRight: 8,
+                    }} />
+                    <Text style={{ flex: 1, fontSize: 12, color: '#666' }}>
+                      {item.bus.bus_name || `Bus ${item.bus.id?.slice(-4)}`}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#e11d48' }}>
+                      {item.etaMinutes} min
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </TouchableOpacity>
+        );
+      })()}
+
       {ridingBus && (() => {
         // Prepare Data for the Card
         // Use API-fetched passenger count directly
@@ -1491,7 +2415,25 @@ const MapScreen = () => {
         const nextStopName = nextStop ? (nextStop.stopName || `Stop #${nextStop.stopNumber}`) : 'Terminus';
 
         return (
-          <View style={styles.ridingCard}>
+          <TouchableOpacity
+            style={styles.ridingCard}
+            activeOpacity={0.9}
+            onPress={() => {
+              // Zoom to bus location when card is pressed
+              if (ridingBus && mapRef.current) {
+                const busLat = ridingBus.current_lat || ridingBus.lat;
+                const busLon = ridingBus.current_lon || ridingBus.lon;
+                if (busLat && busLon) {
+                  mapRef.current.animateToRegion({
+                    latitude: busLat,
+                    longitude: busLon,
+                    latitudeDelta: 0.005,
+                    longitudeDelta: 0.005,
+                  }, 500);
+                }
+              }
+            }}
+          >
             {/* Header: Bus Info & Signal */}
             <View style={styles.ridingHeader}>
               <View>
@@ -1592,7 +2534,7 @@ const MapScreen = () => {
             </TouchableOpacity>
 
             {/* Exit Button Removed per Auto-Detect Logic */}
-          </View>
+          </TouchableOpacity>
         );
       })()}
     </View>

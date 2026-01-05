@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { API_BASE } from '../config/api';
+import { API_BASE, getApiHeaders } from '../config/api';
 
 const MAPPING_KEY = '@bus_route_mapping';
 
@@ -96,7 +96,9 @@ export const fetchAndSyncMappings = async (serverUrl = API_BASE) => {
         const localVersion = localVersionStr ? parseInt(localVersionStr, 10) : 0;
 
         // Fetch from server with version check
-        const response = await fetch(`${serverUrl}/api/bus-route-mapping?version=${localVersion}`);
+        const response = await fetch(`${serverUrl}/api/bus-route-mapping?version=${localVersion}`, {
+            headers: getApiHeaders(),
+        });
         if (!response.ok) {
             console.log('[BusRouteMapping] Server unavailable');
             return false;

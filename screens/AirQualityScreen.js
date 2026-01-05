@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, FlatList, Platform, TouchableOpacity, Alert } from 'react-native';
 import * as Location from 'expo-location';
 import axios from 'axios';
-import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
+import { getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG, getConnectionMode } from '../config/api';
 import { useDebug } from '../contexts/DebugContext';
 import { useServerConfig } from '../hooks/useServerConfig';
 import { getAirQualityStatus } from '../utils/airQuality';
@@ -65,10 +65,21 @@ const AirQualityScreen = () => {
 
     // MQTT Connection
     const connectMqtt = async () => {
-      if (Platform.OS !== 'web' && serverIp) { // Wait for serverIp
+      if (Platform.OS !== 'web') {
         try {
-          const host = serverIp; // Use from hook
-          const mqttUrl = `ws://${host}:9001`;
+          // Determine MQTT URL based on connection mode
+          const isTunnelMode = getConnectionMode() === 'tunnel';
+          let mqttUrl;
+
+          if (isTunnelMode && MQTT_CONFIG.wsUrl) {
+            mqttUrl = MQTT_CONFIG.wsUrl; // Use tunnel URL (wss://mqtt.catcode.tech)
+          } else if (serverIp) {
+            mqttUrl = `ws://${serverIp}:${MQTT_CONFIG.wsPort || 9001}`; // Local mode
+          } else {
+            console.log('[AirQuality] No MQTT config available, skipping connection');
+            return;
+          }
+
           console.log(`[AirQuality] Attempting to connect to MQTT at ${mqttUrl}`);
           console.log(`[AirQuality] mqtt keys: ${Object.keys(mqtt)}`);
 

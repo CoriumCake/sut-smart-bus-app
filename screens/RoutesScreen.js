@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, FlatList, StyleSheet, TouchableOpacity, Alert, Platform, RefreshControl } from 'react-native';
 import axios from 'axios';
 import { API_BASE, getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
@@ -44,12 +44,18 @@ const RoutesScreen = () => {
     return () => clearInterval(interval);
   }, []);
 
+  // Track if we've already synced routes this session
+  const hasInitiallyLoaded = useRef(false);
+
   // Load buses and their assigned routes
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (forceServerSync = false) => {
     try {
-      // First, sync routes from server to local storage
-      // This ensures all clients have the latest routes
-      await downloadRoutesFromServer();
+      // Only sync from server on first load or manual refresh
+      // This prevents unnecessary network calls when navigating back
+      if (!hasInitiallyLoaded.current || forceServerSync) {
+        await downloadRoutesFromServer();
+        hasInitiallyLoaded.current = true;
+      }
 
       // Fetch buses from server
       const apiKey = await checkApiKey();
@@ -73,6 +79,7 @@ const RoutesScreen = () => {
       // Load route mappings and route data for each bus
       const mappings = await getAllMappings();
       const routeDataMap = {};
+
 
       for (const bus of fetchedBuses) {
         const busMac = bus.bus_mac || bus.mac_address || bus.id;
@@ -111,7 +118,7 @@ const RoutesScreen = () => {
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await loadData();
+    await loadData(true); // Force server sync on manual refresh
     setRefreshing(false);
   };
 

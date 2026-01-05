@@ -35,11 +35,31 @@ const BusRouteAdminScreen = () => {
                     timeout: 5000
                 });
                 if (busResponse.data && Array.isArray(busResponse.data)) {
-                    setBuses(busResponse.data);
+                    // Add fake test bus for debugging
+                    const fakeBus = {
+                        id: 'FAKE-BUS-TEST',
+                        bus_mac: 'FAKE-BUS-TEST',
+                        bus_name: '🧪 Fake Test Bus',
+                        isFake: true
+                    };
+                    setBuses([...busResponse.data, fakeBus]);
+                } else {
+                    // Still add fake bus even if no real buses
+                    setBuses([{
+                        id: 'FAKE-BUS-TEST',
+                        bus_mac: 'FAKE-BUS-TEST',
+                        bus_name: '🧪 Fake Test Bus',
+                        isFake: true
+                    }]);
                 }
             } catch (e) {
-                console.log('Could not fetch buses from server, using empty list');
-                setBuses([]);
+                console.log('Could not fetch buses from server, using fake bus only');
+                setBuses([{
+                    id: 'FAKE-BUS-TEST',
+                    bus_mac: 'FAKE-BUS-TEST',
+                    bus_name: '🧪 Fake Test Bus',
+                    isFake: true
+                }]);
             }
 
             // Fetch local routes
