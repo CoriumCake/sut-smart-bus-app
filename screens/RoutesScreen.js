@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, FlatList, StyleSheet, TouchableOpacity, Alert, Platform, RefreshControl } from 'react-native';
 import axios from 'axios';
-import { API_BASE, getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as mqtt from 'mqtt';
+import { API_BASE, getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG } from '../config/api';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useDebug } from '../contexts/DebugContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useLanguage } from '../contexts/LanguageContext';
@@ -12,6 +14,9 @@ import { useLanguage } from '../contexts/LanguageContext';
 import { getAllRoutes, loadRoute, downloadRoutesFromServer } from '../utils/routeStorage';
 import { getAllMappings, getRouteIdForBus } from '../utils/busRouteMapping';
 import { findNextStop } from '../utils/routeHelpers';
+
+// MQTT client for real-time bus detection
+let mqttClient = null;
 
 const RoutesScreen = () => {
   const [buses, setBuses] = useState([]);
@@ -42,6 +47,114 @@ const RoutesScreen = () => {
     fetchCount();
     const interval = setInterval(fetchCount, 5000);
     return () => clearInterval(interval);
+  }, []);
+
+  // MQTT: Connect and subscribe for real-time bus detection
+  useEffect(() => {
+    const connectMqtt = async () => {
+      if (Platform.OS === 'web') return;
+
+      try {
+        const overrideIp = await AsyncStorage.getItem('serverIp');
+        const host = overrideIp || MQTT_CONFIG.host;
+        const mqttUrl = `ws://${host}:${MQTT_CONFIG.wsPort}`;
+
+        if (mqtt && typeof mqtt.connect === 'function') {
+          mqttClient = mqtt.connect(mqttUrl);
+
+          mqttClient.on('connect', () => {
+            console.log('[RoutesScreen] Connected to MQTT Broker');
+            mqttClient.subscribe('sut/bus/gps', (err) => {
+              if (err) console.error('[RoutesScreen] MQTT subscription error:', err);
+              else console.log('[RoutesScreen] Subscribed to sut/bus/gps');
+            });
+            mqttClient.subscribe('sut/bus/+/status', (err) => {
+              if (err) console.error('[RoutesScreen] MQTT status subscription error:', err);
+            });
+          });
+
+          mqttClient.on('message', (topic, message) => {
+            try {
+              const data = JSON.parse(message.toString());
+              if (topic === 'sut/bus/gps' && data.bus_mac) {
+                // Auto-add or update bus from MQTT
+                setBuses(prevBuses => {
+                  const existingIndex = prevBuses.findIndex(b =>
+                    (b.bus_mac || b.mac_address) === data.bus_mac
+                  );
+
+                  if (existingIndex > -1) {
+                    // Update existing bus
+                    const updated = [...prevBuses];
+                    const oldBus = updated[existingIndex];
+                    updated[existingIndex] = {
+                      ...oldBus,
+                      bus_name: (data.bus_name) ? data.bus_name : oldBus.bus_name,
+                      current_lat: (data.lat !== null && data.lat !== undefined) ? data.lat : oldBus.current_lat,
+                      current_lon: (data.lon !== null && data.lon !== undefined) ? data.lon : oldBus.current_lon,
+                      pm2_5: data.pm2_5,
+                      pm10: data.pm10,
+                      temp: data.temp,
+                      hum: data.hum,
+                    };
+                    return updated;
+                  } else {
+                    // Add new bus (auto-detect!)
+                    console.log('[RoutesScreen] 🚌 New bus detected via MQTT:', data.bus_name || data.bus_mac);
+                    return [...prevBuses, {
+                      id: data.bus_mac,
+                      bus_mac: data.bus_mac,
+                      mac_address: data.bus_mac,
+                      bus_name: data.bus_name || `Bus-${data.bus_mac.slice(-5)}`,
+                      current_lat: data.lat,
+                      current_lon: data.lon,
+                      pm2_5: data.pm2_5,
+                      pm10: data.pm10,
+                      temp: data.temp,
+                      hum: data.hum,
+                    }];
+                  }
+                });
+              } else if (topic.includes('/status')) {
+                // sut/bus/{id}/status
+                const parts = topic.split('/');
+                const busId = parts[2];
+                if (busId && data.rssi !== undefined) {
+                  setBuses(prevBuses => {
+                    const idx = prevBuses.findIndex(b => b.bus_mac === busId || b.id === busId || b.bus_name === busId);
+                    if (idx > -1) {
+                      const updated = [...prevBuses];
+                      updated[idx] = {
+                        ...updated[idx],
+                        rssi: data.rssi
+                      };
+                      return updated;
+                    }
+                    return prevBuses;
+                  });
+                }
+              }
+            } catch (e) {
+              // Silent parse error
+            }
+          });
+
+          mqttClient.on('error', () => { /* Silent */ });
+          mqttClient.on('close', () => { /* Silent */ });
+        }
+      } catch (e) {
+        console.log('[RoutesScreen] MQTT init error:', e.message);
+      }
+    };
+
+    connectMqtt();
+
+    return () => {
+      if (mqttClient) {
+        try { mqttClient.end(); } catch (e) { }
+        mqttClient = null;
+      }
+    };
   }, []);
 
   // Track if we've already synced routes this session
@@ -150,9 +263,29 @@ const RoutesScreen = () => {
             <Ionicons name="bus" size={28} color={theme.primary} />
           </View>
           <View style={styles.busInfo}>
-            <Text style={[styles.busName, { color: theme.text }]}>
-              {bus.bus_name || `Bus ${busMac.slice(-5)}`}
-            </Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Text style={[styles.busName, { color: theme.text, marginRight: 8 }]}>
+                {bus.bus_name || bus.bus_mac || bus.id}
+              </Text>
+              {/* WiFi Signal Icon */}
+              {(() => {
+                const signal = bus.rssi;
+                if (signal === undefined || signal === null) return null;
+
+                let iconName = 'wifi-strength-outline';
+                let color = '#ef4444';
+
+                if (signal >= -55) { iconName = 'wifi-strength-4'; color = '#10b981'; }
+                else if (signal >= -65) { iconName = 'wifi-strength-3'; color = '#10b981'; }
+                else if (signal >= -75) { iconName = 'wifi-strength-2'; color = '#f59e0b'; }
+                else if (signal >= -85) { iconName = 'wifi-strength-1'; color = '#f97316'; }
+                else { iconName = 'wifi-strength-alert-outline'; color = '#ef4444'; }
+
+                return (
+                  <MaterialCommunityIcons name={iconName} size={20} color={color} />
+                );
+              })()}
+            </View>
             {hasRoute ? (
               <Text style={[styles.routeName, { color: theme.primary }]}>
                 🛣️ {routeData.route.routeName}

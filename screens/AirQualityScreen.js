@@ -2,16 +2,19 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, FlatList, Platform, TouchableOpacity, Alert } from 'react-native';
 import * as Location from 'expo-location';
 import axios from 'axios';
+import { useNavigation } from '@react-navigation/native';
+import { Ionicons } from '@expo/vector-icons';
 import { getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG, getConnectionMode } from '../config/api';
 import { useDebug } from '../contexts/DebugContext';
 import { useServerConfig } from '../hooks/useServerConfig';
 import { getAirQualityStatus } from '../utils/airQuality';
 import AirQualityMap from '../components/AirQualityMap';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as mqtt from 'mqtt'; // <-- ADDED: MQTT Client
+import * as mqtt from 'mqtt';
 
 
 const AirQualityScreen = () => {
+  const navigation = useNavigation();
   const { debugMode } = useDebug();
   const { serverIp } = useServerConfig(); // Use hook
   const [buses, setBuses] = useState([]);
@@ -102,14 +105,6 @@ const AirQualityScreen = () => {
                   console.error('[AirQuality] ❌ Fast GPS subscription error:', err);
                 }
               });
-              // Subscribe directly to ESP32 sensor data (includes PM, temp, humidity)
-              client.subscribe('sut/bus/gps', (err) => {
-                if (!err) {
-                  console.log('[AirQuality] ✅ Subscribed to sut/bus/gps (sensor data)');
-                } else {
-                  console.error('[AirQuality] ❌ Sensor subscription error:', err);
-                }
-              });
             });
 
             client.on('reconnect', () => {
@@ -126,7 +121,7 @@ const AirQualityScreen = () => {
                 // console.log(`[AirQuality] 📩 Received msg on ${topic}: ${msgString.substring(0, 50)}...`);
 
                 const data = JSON.parse(msgString);
-                if (topic === 'sut/app/bus/location' || topic === 'sut/bus/gps') {
+                if (topic === 'sut/app/bus/location') {
                   // Handle both server-bridged data and direct ESP32 data
                   // console.log(`[AirQuality] 📡 Received sensor data on ${topic}:`,
                   //   `PM2.5=${data.pm2_5}, PM10=${data.pm10}, Temp=${data.temp}, Hum=${data.hum}`);
@@ -142,12 +137,13 @@ const AirQualityScreen = () => {
                         id: data.bus_mac,
                         bus_mac: data.bus_mac,
                         mac_address: data.bus_mac,
-                        current_lat: data.lat,
-                        current_lon: data.lon,
-                        pm2_5: data.pm2_5,
-                        pm10: data.pm10,
-                        temp: data.temp,
-                        hum: data.hum,
+                        // Only update fields if they are present in the payload (avoid overwriting with null)
+                        current_lat: (data.lat !== undefined && data.lat !== null) ? data.lat : updatedBuses[index].current_lat,
+                        current_lon: (data.lon !== undefined && data.lon !== null) ? data.lon : updatedBuses[index].current_lon,
+                        pm2_5: (data.pm2_5 !== undefined && data.pm2_5 !== null) ? data.pm2_5 : updatedBuses[index].pm2_5,
+                        pm10: (data.pm10 !== undefined && data.pm10 !== null) ? data.pm10 : updatedBuses[index].pm10,
+                        temp: (data.temp !== undefined && data.temp !== null) ? data.temp : updatedBuses[index].temp,
+                        hum: (data.hum !== undefined && data.hum !== null) ? data.hum : updatedBuses[index].hum,
                       };
                     } else {
                       console.log(`[AirQuality] ➕ Adding new bus ${data.bus_mac}`);
@@ -155,6 +151,7 @@ const AirQualityScreen = () => {
                         id: data.bus_mac,
                         bus_mac: data.bus_mac,
                         mac_address: data.bus_mac,
+                        bus_name: data.bus_name || `Bus-${data.bus_mac.slice(-5)}`,
                         current_lat: data.lat,
                         current_lon: data.lon,
                         pm2_5: data.pm2_5,
@@ -399,12 +396,12 @@ const AirQualityScreen = () => {
           </View>
         </View>
         <View style={styles.cardBody}>
-          <Text style={styles.metric}>PM2.5: <Text style={styles.bold}>{item.pm2_5?.toFixed(1) || '--'}</Text> µg/m³</Text>
-          <Text style={styles.metric}>PM10: <Text style={styles.bold}>{item.pm10?.toFixed(1) || '--'}</Text> µg/m³</Text>
+          <Text style={styles.metric}>PM2.5: <Text style={styles.bold}>{item.pm2_5 !== undefined && item.pm2_5 !== null ? item.pm2_5.toFixed(1) : '--'}</Text> µg/m³</Text>
+          <Text style={styles.metric}>PM10: <Text style={styles.bold}>{item.pm10 !== undefined && item.pm10 !== null ? item.pm10.toFixed(1) : '--'}</Text> µg/m³</Text>
         </View>
         <View style={[styles.cardBody, { marginTop: 5 }]}>
-          <Text style={styles.metric}>Temp: <Text style={styles.bold}>{item.temp?.toFixed(1) || '--'}</Text> °C</Text>
-          <Text style={styles.metric}>Hum: <Text style={styles.bold}>{item.hum?.toFixed(0) || '--'}</Text> %</Text>
+          <Text style={styles.metric}>Temp: <Text style={styles.bold}>{item.temp !== undefined && item.temp !== null ? item.temp.toFixed(1) : '--'}</Text> °C</Text>
+          <Text style={styles.metric}>Hum: <Text style={styles.bold}>{item.hum !== undefined && item.hum !== null ? item.hum.toFixed(0) : '--'}</Text> %</Text>
         </View>
         {hasDestination && (
           <Text style={styles.destinationText}>🎯 Destination set</Text>
@@ -447,7 +444,15 @@ const AirQualityScreen = () => {
       )}
 
       <View style={styles.listContainer}>
-        <Text style={styles.listTitle}>Live Bus Air Quality</Text>
+        <View style={styles.listHeader}>
+          <Text style={styles.listTitle}>Live Bus Air Quality</Text>
+          <TouchableOpacity
+            style={styles.dashboardButton}
+            onPress={() => navigation.navigate('AirQualityDashboard', { buses })}
+          >
+            <Ionicons name="stats-chart" size={22} color="#2196F3" />
+          </TouchableOpacity>
+        </View>
         {error && <Text style={styles.error}>{error}</Text>}
         <FlatList
           data={buses}
@@ -480,6 +485,17 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 5,
     elevation: 5,
+  },
+  listHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  dashboardButton: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: 'rgba(33, 150, 243, 0.1)',
   },
   listTitle: {
     fontSize: 20,

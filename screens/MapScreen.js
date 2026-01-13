@@ -828,6 +828,7 @@ const MapScreen = () => {
               const data = JSON.parse(message.toString());
 
               if (topic === 'sut/app/bus/location' || topic === 'sut/bus/gps') {
+                console.log(`[App] Bus Update: ${topic} Name=${data.bus_name} MAC=${data.bus_mac}`);
                 // Handle both server-bridged data and direct ESP32 sensor data
                 setBuses(prevBuses => {
                   const existingBusIndex = prevBuses.findIndex(b => b.bus_mac === data.bus_mac);
@@ -837,6 +838,7 @@ const MapScreen = () => {
 
                     updatedBuses[existingBusIndex] = {
                       ...oldBus,
+                      bus_name: (data.bus_name) ? data.bus_name : oldBus.bus_name,
                       current_lat: (data.lat !== null && data.lat !== undefined) ? data.lat : oldBus.current_lat,
                       current_lon: (data.lon !== null && data.lon !== undefined) ? data.lon : oldBus.current_lon,
                       seats_available: data.seats_available ?? oldBus.seats_available,
@@ -851,8 +853,6 @@ const MapScreen = () => {
                       id: data.bus_mac,
                       bus_mac: data.bus_mac,
                       bus_name: data.bus_name,
-                      current_lat: data.lat,
-                      current_lon: data.lon,
                       seats_available: data.seats_available,
                       pm2_5: data.pm2_5,
                       pm10: data.pm10,
@@ -887,11 +887,34 @@ const MapScreen = () => {
                   }
                   return prevBuses;
                 });
-              } else if (topic.includes('/status')) {
+              }
+
+              if (topic.includes('/status')) {
                 // sut/bus/ESP32-CAM-01/status
-                // Check if topic matches the riding bus ID, MAC, or explicitly the known ESP32 ID
-                if (ridingBus && (topic.includes(ridingBus.bus_mac) || topic.includes(ridingBus.id) || topic.includes('ESP32-CAM-01'))) {
-                  setBusSignal(data.rssi);
+                // Extract Bus ID from topic: sut/bus/{id}/status
+                const parts = topic.split('/');
+                const busId = parts[2];
+
+                if (busId && data.rssi !== undefined) {
+                  setBuses(prevBuses => {
+                    const idx = prevBuses.findIndex(b => b.bus_mac === busId || b.id === busId || b.bus_name === busId);
+                    if (idx > -1) {
+                      const updated = [...prevBuses];
+                      updated[idx] = {
+                        ...updated[idx],
+                        rssi: data.rssi,
+                        isOnline: true,
+                        lastSignalUpdate: Date.now()
+                      };
+                      return updated;
+                    }
+                    return prevBuses;
+                  });
+
+                  // Also update local signal state if this is our riding bus
+                  if (ridingBus && (busId === ridingBus.bus_mac || busId === ridingBus.id)) {
+                    setBusSignal(data.rssi);
+                  }
                 }
               }
 
@@ -980,6 +1003,10 @@ const MapScreen = () => {
       // Determine if we need to update (simple ref check might be enough if setBuses returns new objects)
       if (liveBus && liveBus !== ridingBus) {
         setRidingBus(liveBus);
+        // Also sync signal if available in liveBus (from MQTT status)
+        if (liveBus.rssi !== undefined) {
+          setBusSignal(liveBus.rssi);
+        }
       }
     }
   }, [buses]);
@@ -1189,7 +1216,55 @@ const MapScreen = () => {
         timeout: 5000
       });
       if (response.data && Array.isArray(response.data)) {
-        setBuses(response.data);
+        setBuses(prevBuses => {
+          const apiBuses = response.data;
+          const mergedBuses = [...prevBuses];
+
+          // 1. Update existing buses or Add new ones from API
+          apiBuses.forEach(apiBus => {
+            const existingIdx = mergedBuses.findIndex(b => b.id === apiBus.id || b.bus_mac === apiBus.bus_mac);
+
+            // Logic to preserve non-API fields
+            let finalName = apiBus.bus_name;
+
+            if (existingIdx > -1) {
+              const existing = mergedBuses[existingIdx];
+
+              // Protect Bus Name: Keep existing name if API sends generic "Bus-XX"
+              if (existing.bus_name && existing.bus_name !== 'Bus' && !existing.bus_name.startsWith('Bus-')) {
+                if (!apiBus.bus_name || apiBus.bus_name.startsWith('Bus-')) {
+                  finalName = existing.bus_name;
+                }
+              }
+
+              // Update existing bus
+              mergedBuses[existingIdx] = {
+                ...existing, // Keep local state (like RSSI, isOnline)
+                ...apiBus,   // Overwrite with server data (lat/lon, counts)
+                bus_name: finalName,
+                // Explicitly preserve these local-only fields that API might not have or might be null
+                rssi: existing.rssi,
+                isOnline: existing.isOnline,
+                lastSignalUpdate: existing.lastSignalUpdate,
+                // If API is offline (no lat/lon), keep local lat/lon
+                current_lat: (apiBus.current_lat || apiBus.lat) || existing.current_lat,
+                current_lon: (apiBus.current_lon || apiBus.lon) || existing.current_lon,
+              };
+            } else {
+              // Add new bus from API
+              mergedBuses.push({
+                ...apiBus,
+                bus_name: finalName
+              });
+            }
+          });
+
+          // 2. We DO NOT remove buses that are missing from API.
+          // They stay in the list (possibly offline). 
+          // This prevents flickering if independent MQTT updates keep them alive.
+
+          return mergedBuses;
+        });
       }
     } catch (error) {
       console.log('Error fetching buses (server may be offline):', error.message);
@@ -2416,7 +2491,10 @@ const MapScreen = () => {
 
         return (
           <TouchableOpacity
-            style={styles.ridingCard}
+            style={[
+              styles.ridingCard,
+              (ridingBus.rssi === null || ridingBus.rssi === undefined || ridingBus.rssi < -85) && { opacity: 0.6 }
+            ]}
             activeOpacity={0.9}
             onPress={() => {
               // Zoom to bus location when card is pressed
@@ -2437,57 +2515,63 @@ const MapScreen = () => {
             {/* Header: Bus Info & Signal */}
             <View style={styles.ridingHeader}>
               <View>
-                <Text style={styles.ridingTitle}>{ridingBus.bus_name || `Bus ${ridingBus.id}`}</Text>
+                <Text style={styles.ridingTitle}>{ridingBus.bus_name || ridingBus.id || "Bus"}</Text>
                 <Text style={styles.ridingSubtitle}>
                   {activeRoute ? activeRoute.routeName : 'No Route Selected'}
                 </Text>
               </View>
 
               {/* Signal Indicator */}
-              {busSignal !== null && (
-                <View style={styles.signalContainer}>
-                  {(() => {
-                    let iconName = 'wifi-strength-outline';
-                    let color = '#ef4444'; // Red default (weak/none)
-                    let label = 'Offline';
+              <View style={styles.signalContainer}>
+                {(() => {
+                  const signal = ridingBus.rssi ?? busSignal; // Use bus-specific RSSI if available
 
-                    if (busSignal >= -55) {
-                      iconName = 'wifi-strength-4';
-                      color = '#10b981'; // Green
-                      label = 'Excellent';
-                    } else if (busSignal >= -65) {
-                      iconName = 'wifi-strength-3';
-                      color = '#10b981';
-                      label = 'Good';
-                    } else if (busSignal >= -75) {
-                      iconName = 'wifi-strength-2';
-                      color = '#f59e0b'; // Yellow
-                      label = 'Fair';
-                    } else if (busSignal >= -85) {
-                      iconName = 'wifi-strength-1';
-                      color = '#f97316'; // Orange
-                      label = 'Weak';
-                    } else {
-                      iconName = 'wifi-strength-alert-outline'; // Or strength-outline
-                      color = '#ef4444';
-                      label = 'Poor';
-                    }
+                  let iconName = 'wifi-strength-outline';
+                  let color = '#ef4444'; // Red default (weak/none)
+                  let label = 'Offline';
 
-                    return (
-                      <View style={{ alignItems: 'flex-end' }}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                          {/* Using larger icon for emphasis */}
-                          <MaterialCommunityIcons name={iconName} size={24} color={color} />
+                  // Logic: If signal is missing or very low, treat as offline/bad
+                  if (signal === null || signal === undefined) {
+                    iconName = 'wifi-off';
+                    color = '#9ca3af'; // Gray
+                    label = 'Offline';
+                  } else if (signal >= -55) {
+                    iconName = 'wifi-strength-4';
+                    color = '#10b981'; // Green
+                    label = 'Excellent';
+                  } else if (signal >= -65) {
+                    iconName = 'wifi-strength-3';
+                    color = '#10b981';
+                    label = 'Good';
+                  } else if (signal >= -75) {
+                    iconName = 'wifi-strength-2';
+                    color = '#f59e0b'; // Yellow
+                    label = 'Fair';
+                  } else if (signal >= -85) {
+                    iconName = 'wifi-strength-1';
+                    color = '#f97316'; // Orange
+                    label = 'Weak';
+                  } else {
+                    iconName = 'wifi-strength-alert-outline';
+                    color = '#ef4444';
+                    label = 'Poor';
+                  }
+
+                  return (
+                    <View style={{ alignItems: 'flex-end' }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                        <MaterialCommunityIcons name={iconName} size={24} color={color} />
+                        {signal !== null && signal !== undefined && (
                           <Text style={{ fontSize: 14, color: color, marginLeft: 4, fontWeight: 'bold' }}>
-                            {busSignal} dBm
+                            {signal} dBm
                           </Text>
-                        </View>
-                        <Text style={{ fontSize: 10, color: '#9ca3af' }}>{label}</Text>
+                        )}
                       </View>
-                    );
-                  })()}
-                </View>
-              )}
+                      <Text style={{ fontSize: 10, color: '#9ca3af' }}>{label}</Text>
+                    </View>
+                  );
+                })()}
+              </View>
             </View>
 
             {/* Info Grid: Next Stop, Seats, PM */}
@@ -2522,7 +2606,8 @@ const MapScreen = () => {
             <TouchableOpacity
               style={[
                 styles.ringButton,
-                (busSignal !== null && busSignal <= -80) && styles.disabledButton
+                (busSignal !== null && busSignal <= -80) && styles.disabledButton,
+                { opacity: (busSignal !== null && busSignal <= -80) ? 0.5 : 1 }
               ]}
               onPress={handleRing}
               disabled={busSignal !== null && busSignal <= -80}

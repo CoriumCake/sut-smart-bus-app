@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { ENV } from './env';
@@ -6,9 +7,16 @@ import { ENV } from './env';
 const isTunnelMode = ENV.CONNECTION_MODE === 'tunnel';
 
 // Construct the base URL based on connection mode
-export const API_BASE = isTunnelMode
-  ? ENV.API_URL
-  : `http://${ENV.EXPO_PUBLIC_SERVER_IP}:${ENV.EXPO_PUBLIC_API_PORT}`;
+export const API_BASE = (() => {
+  if (isTunnelMode) return ENV.API_URL;
+
+  let host = ENV.EXPO_PUBLIC_SERVER_IP;
+  // Fix for Android Emulator trying to access localhost
+  if (Platform.OS === 'android' && (host === 'localhost' || host === '127.0.0.1')) {
+    host = '10.0.2.2';
+  }
+  return `http://${host}:${ENV.EXPO_PUBLIC_API_PORT}`;
+})();
 
 // MQTT Configuration (exported for use in screens)
 export const MQTT_CONFIG = isTunnelMode
@@ -19,7 +27,9 @@ export const MQTT_CONFIG = isTunnelMode
   }
   : {
     // Local mode - use IP and ports
-    host: ENV.MQTT_BROKER_HOST || ENV.EXPO_PUBLIC_SERVER_IP,
+    host: Platform.OS === 'android' && (ENV.MQTT_BROKER_HOST === 'localhost' || ENV.MQTT_BROKER_HOST === '127.0.0.1')
+      ? '10.0.2.2'
+      : (ENV.MQTT_BROKER_HOST || ENV.EXPO_PUBLIC_SERVER_IP),
     port: ENV.MQTT_BROKER_PORT || 1883,
     wsPort: ENV.MQTT_WEBSOCKET_PORT || 9001,
     useSecure: false,

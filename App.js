@@ -18,6 +18,7 @@ import SettingsScreen from './screens/SettingsScreen';
 import RouteEditorScreen from './screens/RouteEditorScreen';
 import BusRouteAdminScreen from './screens/BusRouteAdminScreen';
 import BusManagementScreen from './screens/BusManagementScreen';
+import AirQualityDashboardScreen from './screens/AirQualityDashboardScreen';
 import AboutScreen from './screens/AboutScreen';
 import { createStackNavigator } from '@react-navigation/stack';
 import { loadDefaultRoutes } from './utils/defaultRoutes';
@@ -71,6 +72,7 @@ const AppNavigator = () => {
       <Stack.Screen name="RouteEditor" component={RouteEditorScreen} />
       <Stack.Screen name="BusRouteAdmin" component={BusRouteAdminScreen} />
       <Stack.Screen name="BusManagement" component={BusManagementScreen} />
+      <Stack.Screen name="AirQualityDashboard" component={AirQualityDashboardScreen} />
       <Stack.Screen name="About" component={AboutScreen} />
     </Stack.Navigator>
   );
