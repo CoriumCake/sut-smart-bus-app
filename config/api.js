@@ -18,22 +18,8 @@ export const API_BASE = (() => {
   return `http://${host}:${ENV.EXPO_PUBLIC_API_PORT}`;
 })();
 
-// MQTT Configuration (exported for use in screens)
-export const MQTT_CONFIG = isTunnelMode
-  ? {
-    // Cloudflare Tunnel mode - use WebSocket URL
-    wsUrl: ENV.MQTT_WS_URL,
-    useSecure: true,
-  }
-  : {
-    // Local mode - use IP and ports
-    host: Platform.OS === 'android' && (ENV.MQTT_BROKER_HOST === 'localhost' || ENV.MQTT_BROKER_HOST === '127.0.0.1')
-      ? '10.0.2.2'
-      : (ENV.MQTT_BROKER_HOST || ENV.EXPO_PUBLIC_SERVER_IP),
-    port: ENV.MQTT_BROKER_PORT || 1883,
-    wsPort: ENV.MQTT_WEBSOCKET_PORT || 9001,
-    useSecure: false,
-  };
+// MQTT Configuration Removed (HTTP Only)
+// export const MQTT_CONFIG = ...
 
 // Get headers for API requests (includes auth if configured)
 export const getApiHeaders = () => {

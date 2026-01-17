@@ -6,6 +6,7 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import axios from 'axios';
 import { getApiUrl } from '../config/api';
+import { getAllRoutes, downloadRoutesFromServer } from '../utils/routeStorage';
 
 const PMZoneEditorScreen = () => {
     const navigation = useNavigation();
@@ -15,13 +16,22 @@ const PMZoneEditorScreen = () => {
     const [MapView, setMapView] = useState(null);
     const [Marker, setMarker] = useState(null);
     const [Polygon, setPolygon] = useState(null);
+    const [Polyline, setPolyline] = useState(null);
 
     const [zoneName, setZoneName] = useState('');
-    const [points, setPoints] = useState([]);
+
+    // History Management for Undo/Redo
+    const [history, setHistory] = useState([[]]); // Initial state: empty array of points
+    const [historyIndex, setHistoryIndex] = useState(0);
+    const points = history[historyIndex] || []; // Derived state
+
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [userLocation, setUserLocation] = useState(null);
-    const [showGrid, setShowGrid] = useState(false);
+
+    // Route Overlay State
+    const [routes, setRoutes] = useState([]);
+    const [showRoutes, setShowRoutes] = useState(false);
 
     // Edit Handling
     const [editingIndex, setEditingIndex] = useState(null);
@@ -42,11 +52,21 @@ const PMZoneEditorScreen = () => {
                     setMapView(() => maps.default);
                     setMarker(() => maps.Marker);
                     setPolygon(() => maps.Polygon);
+                    setPolyline(() => maps.Polyline);
                 }
             }
 
-            // Load existing zone if editing (Future support)
-            // For now, we assume new zone creation usually
+            // Load routes for overlay
+            try {
+                // Ensure we have latest routes
+                await downloadRoutesFromServer();
+                const savedRoutes = await getAllRoutes();
+                if (isMounted) {
+                    setRoutes(savedRoutes);
+                }
+            } catch (e) {
+                console.log("Error loading routes for overlay:", e);
+            }
 
             // Get user location for initial map region
             try {
@@ -68,17 +88,49 @@ const PMZoneEditorScreen = () => {
         return () => { isMounted = false; };
     }, [zoneId]);
 
-    const handleMapPress = (e) => {
-        if (!editingIndex) {
-            const { coordinate } = e.nativeEvent;
-            setPoints([...points, coordinate]);
+    // --- History Helper ---
+    const updatePointsWithHistory = (newPoints) => {
+        const newHistory = history.slice(0, historyIndex + 1);
+        newHistory.push(newPoints);
+        setHistory(newHistory);
+        setHistoryIndex(newHistory.length - 1);
+    };
+
+    const handleUndo = () => {
+        if (historyIndex > 0) {
+            setHistoryIndex(historyIndex - 1);
         }
     };
 
-    const handleMarkerDrag = (index, coordinate) => {
+    const handleRedo = () => {
+        if (historyIndex < history.length - 1) {
+            setHistoryIndex(historyIndex + 1);
+        }
+    };
+
+    const handleClearAll = () => {
+        if (points.length === 0) return;
+        Alert.alert(
+            "Clear All Points",
+            "Are you sure you want to remove all points?",
+            [
+                { text: "Cancel", style: "cancel" },
+                { text: "Clear", style: "destructive", onPress: () => updatePointsWithHistory([]) }
+            ]
+        );
+    };
+
+    const handleMapPress = (e) => {
+        if (!editingIndex) {
+            const { coordinate } = e.nativeEvent;
+            updatePointsWithHistory([...points, coordinate]);
+        }
+    };
+
+    const handleMarkerDragEnd = (index, coordinate) => {
         const newPoints = [...points];
         newPoints[index] = coordinate;
-        setPoints(newPoints);
+        updatePointsWithHistory(newPoints);
     };
 
     const handleFirstMarkerLongPress = () => {
@@ -99,7 +151,7 @@ const PMZoneEditorScreen = () => {
     const handleDeletePoint = (index) => {
         const newPoints = [...points];
         newPoints.splice(index, 1);
-        setPoints(newPoints);
+        updatePointsWithHistory(newPoints);
     };
 
     const handleSave = async () => {
@@ -122,7 +174,6 @@ const PMZoneEditorScreen = () => {
             const payload = {
                 name: zoneName,
                 points: pointsArray,
-                // Server schema expects points
             };
 
             console.log("Saving PM Zone:", payload);
@@ -182,6 +233,40 @@ const PMZoneEditorScreen = () => {
                 </TouchableOpacity>
             </View>
 
+            {/* Toolbar: Undo/Redo/Clear */}
+            <View style={styles.toolbar}>
+                <View style={styles.toolbarGroup}>
+                    <TouchableOpacity
+                        style={[styles.toolBtn, historyIndex === 0 && styles.disabledToolBtn]}
+                        onPress={handleUndo}
+                        disabled={historyIndex === 0}
+                    >
+                        <Ionicons name="arrow-undo" size={20} color={historyIndex === 0 ? "#ccc" : "#333"} />
+                        <Text style={[styles.toolBtnText, { color: historyIndex === 0 ? "#ccc" : "#333" }]}>Undo</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                        style={[styles.toolBtn, historyIndex === history.length - 1 && styles.disabledToolBtn]}
+                        onPress={handleRedo}
+                        disabled={historyIndex === history.length - 1}
+                    >
+                        <Ionicons name="arrow-redo" size={20} color={historyIndex === history.length - 1 ? "#ccc" : "#333"} />
+                        <Text style={[styles.toolBtnText, { color: historyIndex === history.length - 1 ? "#ccc" : "#333" }]}>Redo</Text>
+                    </TouchableOpacity>
+                </View>
+
+                <Text style={styles.pointCounter}>{points.length} pts</Text>
+
+                <TouchableOpacity
+                    style={[styles.toolBtn, styles.clearBtn, points.length === 0 && styles.disabledToolBtn]}
+                    onPress={handleClearAll}
+                    disabled={points.length === 0}
+                >
+                    <Ionicons name="trash-outline" size={20} color={points.length === 0 ? "#ccc" : "#ef4444"} />
+                    <Text style={[styles.toolBtnText, { color: points.length === 0 ? "#ccc" : "#ef4444" }]}>Clear</Text>
+                </TouchableOpacity>
+            </View>
+
             <View style={styles.instructionsContainer}>
                 <Text style={styles.instructionText}>
                     tap map to add points • long-press 1st point to finish • drag points to adjust
@@ -194,6 +279,18 @@ const PMZoneEditorScreen = () => {
                 initialRegion={initialRegion}
                 onPress={handleMapPress}
             >
+                {/* Route Overlays */}
+                {showRoutes && routes.map((r, index) => (
+                    <Polyline
+                        key={`route-${r.routeId || index}`}
+                        coordinates={r.waypoints}
+                        strokeColor={r.routeColor || '#2563eb'}
+                        strokeWidth={2}
+                        lineDashPattern={[5, 5]} // Dashed line to distinguish from zone
+                        tappable={false}
+                    />
+                ))}
+
                 {points.length > 0 && (
                     <Polygon
                         coordinates={points}
@@ -208,8 +305,7 @@ const PMZoneEditorScreen = () => {
                         key={`pt-${index}`}
                         coordinate={p}
                         draggable
-                        onDrag={(e) => handleMarkerDrag(index, e.nativeEvent.coordinate)}
-                        onDragEnd={(e) => handleMarkerDrag(index, e.nativeEvent.coordinate)}
+                        onDragEnd={(e) => handleMarkerDragEnd(index, e.nativeEvent.coordinate)}
                         onPress={() => {
                             if (index !== 0) {
                                 Alert.alert("Remove Point?", "Delete this point from the polygon?", [
@@ -232,6 +328,17 @@ const PMZoneEditorScreen = () => {
                     </Marker>
                 ))}
             </MapView>
+
+            {/* Toggle Routes Logic FAB */}
+            <TouchableOpacity
+                style={[styles.fabButton, { backgroundColor: showRoutes ? '#2563eb' : '#fff' }]}
+                onPress={() => setShowRoutes(!showRoutes)}
+            >
+                <Ionicons name={showRoutes ? "eye" : "eye-off"} size={24} color={showRoutes ? '#fff' : '#666'} />
+                <Text style={[styles.fabText, { color: showRoutes ? '#fff' : '#666' }]}>
+                    {showRoutes ? 'Routes On' : 'Routes Off'}
+                </Text>
+            </TouchableOpacity>
 
             <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
                 <Ionicons name="arrow-back" size={24} color="white" />
@@ -271,6 +378,44 @@ const styles = StyleSheet.create({
     },
     disabledButton: { backgroundColor: '#fca5a5' },
     saveButtonText: { color: '#fff', fontWeight: 'bold' },
+    toolbar: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingHorizontal: 15,
+        paddingVertical: 8,
+        backgroundColor: '#f8f9fa',
+        borderBottomWidth: 1,
+        borderBottomColor: '#eee',
+    },
+    toolbarGroup: {
+        flexDirection: 'row',
+        gap: 15,
+    },
+    toolBtn: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 5,
+    },
+    disabledToolBtn: {
+        opacity: 0.5,
+    },
+    toolBtnText: {
+        marginLeft: 5,
+        fontSize: 14,
+        fontWeight: '500',
+    },
+    clearBtn: {
+        backgroundColor: 'rgba(239, 68, 68, 0.1)',
+        paddingHorizontal: 10,
+        paddingVertical: 5,
+        borderRadius: 15,
+    },
+    pointCounter: {
+        fontSize: 12,
+        color: '#666',
+        fontWeight: 'bold',
+    },
     map: { flex: 1 },
     markerContainer: {
         backgroundColor: 'rgba(255, 255, 255, 0.9)',
@@ -315,6 +460,26 @@ const styles = StyleSheet.create({
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.25,
         shadowRadius: 3.84,
+    },
+    fabButton: {
+        position: 'absolute',
+        bottom: 100,
+        right: 20,
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 15,
+        paddingVertical: 10,
+        borderRadius: 25,
+        elevation: 5,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.25,
+        shadowRadius: 3.84,
+    },
+    fabText: {
+        marginLeft: 8,
+        fontWeight: 'bold',
+        fontSize: 14,
     }
 });
 

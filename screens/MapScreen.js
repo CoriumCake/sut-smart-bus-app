@@ -6,10 +6,9 @@ import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useDebug } from '../contexts/DebugContext';
 import { useTheme } from '../contexts/ThemeContext';
-import { API_BASE, getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG } from '../config/api';
+import { API_BASE, getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
 import { getRouteIdForBus } from '../utils/busRouteMapping';
 import { loadRoute, getAllRoutes } from '../utils/routeStorage';
-import * as mqtt from 'mqtt'; // <-- ADDED: MQTT Client
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { whiteMapStyle, darkMapStyle } from '../utils/mapStyles';
 
@@ -147,7 +146,7 @@ if (Platform.OS !== 'web') {
 
 import PMZoneMarker from '../components/PMZoneMarker';
 
-let client = null;
+
 
 const MapScreen = () => {
   const route = useRoute();
@@ -741,12 +740,12 @@ const MapScreen = () => {
   // Load user location and fetch initial data
   useEffect(() => {
     getLocation();
-    fetchBuses();
+    // fetchBuses(); // Now handled by Polling useEffect
     fetchRoutes();
 
-    // Auto-refresh buses every 5s if not using MQTT
-    const interval = setInterval(fetchBuses, 5000);
-    return () => clearInterval(interval);
+    // Auto-refresh buses every 5s if not using MQTT -> REMOVED in favor of 2s polling above
+    // const interval = setInterval(fetchBuses, 5000);
+    // return () => clearInterval(interval);
   }, []);
 
   // Fetch PM Zones on mount and refresh periodically
@@ -806,187 +805,17 @@ const MapScreen = () => {
     }
   }, [focusBus]);
 
-  const connectMqtt = async () => {
-    if (Platform.OS !== 'web') {
-      // --- MQTT Integration (using config) ---
-      try {
-        // Import MQTT config - get host from AsyncStorage override or config
-        const { MQTT_CONFIG } = require('../config/api');
-        const overrideIp = await AsyncStorage.getItem('serverIp');
-        const host = overrideIp || MQTT_CONFIG.host;
-        const mqttUrl = `ws://${host}:${MQTT_CONFIG.wsPort}`;
-
-        if (mqtt && typeof mqtt.connect === 'function') {
-          client = mqtt.connect(mqttUrl);
-
-          client.on('connect', () => {
-            console.log('Connected to MQTT Broker');
-            setErrorMsg(null);
-
-            client.subscribe('sut/app/bus/location', (err) => {
-              if (err) console.error('Subscription error:', err);
-            });
-            client.subscribe('sut/bus/gps/fast', (err) => {
-              if (err) console.error('GPS Fast subscription error:', err);
-              else console.log('Subscribed to fast GPS topic');
-            });
-            // Subscribe directly to ESP32 sensor data (includes PM, temp, humidity)
-            client.subscribe('sut/bus/gps', (err) => {
-              if (err) console.error('GPS sensor subscription error:', err);
-              else console.log('Subscribed to sut/bus/gps (sensor data)');
-            });
-            client.subscribe('sut/person-detection', (err) => {
-              if (err) console.error('Sub error person:', err);
-            });
-            client.subscribe('sut/bus/+/status', (err) => {
-              if (err) console.error('Sub error status:', err);
-            });
-
-          });
-
-          client.on('message', (topic, message) => {
-            try {
-              const data = JSON.parse(message.toString());
-
-              if (topic === 'sut/app/bus/location' || topic === 'sut/bus/gps') {
-                console.log(`[App] Bus Update: ${topic} Name=${data.bus_name} MAC=${data.bus_mac}`);
-                // Handle both server-bridged data and direct ESP32 sensor data
-                setBuses(prevBuses => {
-                  const existingBusIndex = prevBuses.findIndex(b => b.bus_mac === data.bus_mac);
-                  if (existingBusIndex > -1) {
-                    const updatedBuses = [...prevBuses];
-                    const oldBus = updatedBuses[existingBusIndex];
-
-                    updatedBuses[existingBusIndex] = {
-                      ...oldBus,
-                      bus_name: (data.bus_name) ? data.bus_name : oldBus.bus_name,
-                      current_lat: (data.lat !== null && data.lat !== undefined) ? data.lat : oldBus.current_lat,
-                      current_lon: (data.lon !== null && data.lon !== undefined) ? data.lon : oldBus.current_lon,
-                      seats_available: data.seats_available ?? oldBus.seats_available,
-                      pm2_5: data.pm2_5 ?? oldBus.pm2_5,
-                      pm10: data.pm10 ?? oldBus.pm10,
-                      temp: data.temp ?? oldBus.temp,
-                      hum: data.hum ?? oldBus.hum,
-                    };
-                    return updatedBuses;
-                  } else {
-                    return [...prevBuses, {
-                      id: data.bus_mac,
-                      bus_mac: data.bus_mac,
-                      bus_name: data.bus_name,
-                      seats_available: data.seats_available,
-                      pm2_5: data.pm2_5,
-                      pm10: data.pm10,
-                      temp: data.temp,
-                      hum: data.hum,
-                    }];
-                  }
-                });
-              } else if (topic === 'sut/person-detection') {
-                const newCount = data.count;
-                // 1. Update personCounts state
-                setPersonCounts(prevCounts => ({
-                  entering: newCount !== undefined ? newCount : (prevCounts.entering || 0),
-                  exiting: 0,
-                }));
-                // 2. Sync count to ALL buses for marker display (test mode assumption)
-                if (newCount !== undefined) {
-                  setBuses(prev => prev.map(b => ({ ...b, seats_occupied: newCount })));
-                }
-              } else if (topic === 'sut/bus/gps/fast') {
-                // Fast GPS-only update (lat, lon only - every 500ms)
-                setBuses(prevBuses => {
-                  const idx = prevBuses.findIndex(b => b.bus_mac === data.bus_mac);
-                  if (idx > -1 && data.lat != null && data.lon != null) {
-                    const updated = [...prevBuses];
-                    updated[idx] = {
-                      ...updated[idx],
-                      current_lat: data.lat,
-                      current_lon: data.lon
-                    };
-                    return updated;
-                  }
-                  return prevBuses;
-                });
-              }
-
-              if (topic.includes('/status')) {
-                // sut/bus/ESP32-CAM-01/status
-                // Extract Bus ID from topic: sut/bus/{id}/status
-                const parts = topic.split('/');
-                const busId = parts[2];
-
-                if (busId && data.rssi !== undefined) {
-                  setBuses(prevBuses => {
-                    const idx = prevBuses.findIndex(b => b.bus_mac === busId || b.id === busId || b.bus_name === busId);
-                    if (idx > -1) {
-                      const updated = [...prevBuses];
-                      updated[idx] = {
-                        ...updated[idx],
-                        rssi: data.rssi,
-                        isOnline: true,
-                        lastSignalUpdate: Date.now()
-                      };
-                      return updated;
-                    }
-                    return prevBuses;
-                  });
-
-                  // Also update local signal state if this is our riding bus
-                  if (ridingBus && (busId === ridingBus.bus_mac || busId === ridingBus.id)) {
-                    setBusSignal(data.rssi);
-                  }
-                }
-              }
-
-              // --- SMART ROUTE ANIMATION ---
-              // --- SMART ROUTE ANIMATION ---
-              const currentSelectedRoute = selectedRouteRef.current;
-              const currentBuses = busesRef.current;
-              const currentRidingBus = ridingBusRef.current;
-
-              if (currentSelectedRoute) {
-                const targetBusId = currentSelectedRoute.bus_id || currentSelectedRoute.busId;
-
-                // Use Ref data for search
-                const activeBus = currentRidingBus || currentBuses.find(b => (b.bus_mac || b.mac_address) === targetBusId);
-                const activeBusMac = activeBus?.bus_mac || activeBus?.mac_address || activeBus?.id;
-
-                if (activeBus && data.bus_mac === activeBusMac) {
-                  // Check if data has valid coords
-                  if (data.lat && data.lon) {
-                    updateRouteProgress({ latitude: data.lat, longitude: data.lon }, data.bus_mac);
-                  }
-                }
-              }
-            } catch (error) {
-              console.error('Error parsing MQTT message:', error);
-            }
-          });
-
-          client.on('error', (err) => {
-            // Silence errors
-          });
-
-          client.on('close', () => {
-            // Silence
-          });
-        }
-      } catch (e) {
-        console.error("Failed to initialize MQTT:", e);
-      }
-    }
-  };
-
+  // POLLING (HTTP-Only)
+  // Replaces MQTT
   useEffect(() => {
-    connectMqtt(); // Enable MQTT for person detection
-    return () => {
-      if (client) {
-        try {
-          client.end();
-        } catch (e) { }
-      }
-    };
+    // Initial fetch
+    fetchBuses();
+
+    const interval = setInterval(() => {
+      fetchBuses();
+    }, 2000); // 2s polling
+
+    return () => clearInterval(interval);
   }, []);
 
   // --- FETCH INITIAL PERSON COUNT ---

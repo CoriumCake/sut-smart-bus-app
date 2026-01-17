@@ -1,10 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { View, Text, StyleSheet, FlatList, Platform, TouchableOpacity, Alert } from 'react-native';
 import * as Location from 'expo-location';
 import axios from 'axios';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
-import { getApiUrl, checkApiKey, getApiHeaders, MQTT_CONFIG, getConnectionMode } from '../config/api';
+import { getApiUrl, checkApiKey, getApiHeaders, getConnectionMode } from '../config/api';
 import { useDebug } from '../contexts/DebugContext';
 import { useServerConfig } from '../hooks/useServerConfig';
 import { getAirQualityStatus } from '../utils/airQuality';
@@ -34,185 +34,118 @@ const AirQualityScreen = () => {
     longitudeDelta: 0.005,
   };
 
+  // Force re-render periodically to update offline status
+  const [tick, setTick] = useState(0);
   useEffect(() => {
-    let client;
+    const interval = setInterval(() => setTick(t => t + 1), 10000); // Check every 10s
+    return () => clearInterval(interval);
+  }, []);
 
+  // Fetch buses API function
+  const fetchBusesAPI = useCallback(async () => {
+    try {
+      const apiKey = await checkApiKey();
+      if (!apiKey) return;
 
-    // Initial Fetch
-    const fetchBusesAPI = async () => {
-      try {
-        const apiKey = await checkApiKey();
-        if (!apiKey) {
-          // Don't show error for no API key - graceful degradation
-          return;
-        }
-        const apiUrl = await getApiUrl();
-        const response = await axios.get(`${apiUrl}/api/buses`, {
-          headers: getApiHeaders(),
-          timeout: 5000
-        });
-        const newBuses = response.data;
+      const apiUrl = await getApiUrl();
+      const response = await axios.get(`${apiUrl}/api/buses`, {
+        headers: getApiHeaders(),
+        timeout: 5000
+      });
+      const newBuses = response.data;
 
-        // Check for valid array before processing
-        if (newBuses && Array.isArray(newBuses)) {
-          updateBusesState(newBuses);
-        }
-
-      } catch (err) {
-        console.log('Initial fetch failed (server may be offline):', err.message);
-        // Don't crash - just leave buses empty
+      // Check for valid array before processing
+      if (newBuses && Array.isArray(newBuses)) {
+        // Add timestamp to initial fetch
+        const busesWithTime = newBuses.map(b => ({
+          ...b,
+          last_updated: Date.now() // Assume fresh on fetch
+        }));
+        updateBusesState(busesWithTime);
       }
-    };
+    } catch (err) {
+      console.log('Fetch failed (server may be offline):', err.message);
+    }
+  }, []);
 
+  // ... (useFocusEffect and useEffect for MQTT stay same until setBuses) 
+  // Wait, I can't easily replace just the MQTT handler inner logic with replace_file_content safely due to indentation.
+  // I will use multi_replace.
+
+  const renderBusItem = ({ item }) => {
+    const { status, solidColor } = getAirQualityStatus(item.pm2_5);
+    const hasDestination = destinationMarkers[item.mac_address];
+
+    // Check if offline (> 1 minute silence)
+    const isOffline = item.last_updated && (Date.now() - item.last_updated > 60000);
+    const opacity = isOffline ? 0.4 : 1.0;
+
+    return (
+      <TouchableOpacity
+        style={[styles.card, { opacity }]}
+        onPress={() => zoomToBus(item)}
+        activeOpacity={0.7}
+      >
+        <View style={styles.cardHeader}>
+          <Text style={styles.busName}>{item.bus_name || `Bus ${item.mac_address.slice(-5)}`}</Text>
+          <View style={{ flexDirection: 'row', gap: 5 }}>
+            {/* Show OFFLINE badge if offline */}
+            {isOffline && (
+              <Text style={[styles.statusBadge, { backgroundColor: '#9e9e9e' }]}>OFFLINE</Text>
+            )}
+            {hasDestination && (
+              <TouchableOpacity
+                style={[styles.statusBadge, { backgroundColor: '#F57C00' }]}
+                onPress={() => {
+                  setDestinationMarkers(prev => {
+                    const updated = { ...prev };
+                    delete updated[item.mac_address];
+                    return updated;
+                  });
+                }}
+              >
+                <Text style={{ color: '#fff', fontSize: 10 }}>📍 Clear</Text>
+              </TouchableOpacity>
+            )}
+            <Text style={[styles.statusBadge, { backgroundColor: solidColor }]}>{status}</Text>
+          </View>
+        </View>
+        <View style={styles.cardBody}>
+          <Text style={styles.metric}>PM2.5: <Text style={styles.bold}>{item.pm2_5 !== undefined && item.pm2_5 !== null ? item.pm2_5.toFixed(1) : '--'}</Text> µg/m³</Text>
+          <Text style={styles.metric}>PM10: <Text style={styles.bold}>{item.pm10 !== undefined && item.pm10 !== null ? item.pm10.toFixed(1) : '--'}</Text> µg/m³</Text>
+        </View>
+        <View style={[styles.cardBody, { marginTop: 5 }]}>
+          <Text style={styles.metric}>Temp: <Text style={styles.bold}>{item.temp !== undefined && item.temp !== null ? item.temp.toFixed(1) : '--'}</Text> °C</Text>
+          <Text style={styles.metric}>Hum: <Text style={styles.bold}>{item.hum !== undefined && item.hum !== null ? item.hum.toFixed(0) : '--'}</Text> %</Text>
+        </View>
+        {hasDestination && (
+          <Text style={styles.destinationText}>🎯 Destination set</Text>
+        )}
+      </TouchableOpacity>
+    );
+  };
+
+  // Reload buses when screen gains focus (sync deletion)
+  useFocusEffect(
+    useCallback(() => {
+      fetchBusesAPI();
+    }, [fetchBusesAPI])
+  );
+
+  useEffect(() => {
+    // Initial fetch
     fetchBusesAPI();
 
-    // MQTT Connection
-    const connectMqtt = async () => {
-      if (Platform.OS !== 'web') {
-        try {
-          // Determine MQTT URL based on connection mode
-          const isTunnelMode = getConnectionMode() === 'tunnel';
-          let mqttUrl;
-
-          if (isTunnelMode && MQTT_CONFIG.wsUrl) {
-            mqttUrl = MQTT_CONFIG.wsUrl; // Use tunnel URL (wss://mqtt.catcode.tech)
-          } else if (serverIp) {
-            mqttUrl = `ws://${serverIp}:${MQTT_CONFIG.wsPort || 9001}`; // Local mode
-          } else {
-            console.log('[AirQuality] No MQTT config available, skipping connection');
-            return;
-          }
-
-          console.log(`[AirQuality] Attempting to connect to MQTT at ${mqttUrl}`);
-          console.log(`[AirQuality] mqtt keys: ${Object.keys(mqtt)}`);
-
-          if (mqtt && typeof mqtt.connect === 'function') {
-            client = mqtt.connect(mqttUrl);
-
-            client.on('connect', () => {
-              console.log('[AirQuality] ✅ Connected to MQTT Broker');
-              client.subscribe('sut/app/bus/location', (err) => {
-                if (!err) {
-                  console.log('[AirQuality] ✅ Subscribed to sut/app/bus/location');
-                } else {
-                  console.error('[AirQuality] ❌ Subscription error:', err);
-                }
-              });
-              client.subscribe('sut/bus/gps/fast', (err) => {
-                if (!err) {
-                  console.log('[AirQuality] ✅ Subscribed to sut/bus/gps/fast');
-                } else {
-                  console.error('[AirQuality] ❌ Fast GPS subscription error:', err);
-                }
-              });
-            });
-
-            client.on('reconnect', () => {
-              console.log('[AirQuality] ⚠️ Reconnecting to MQTT...');
-            });
-
-            client.on('offline', () => {
-              console.log('[AirQuality] 🔌 MQTT Client Offline');
-            });
-
-            client.on('message', (topic, message) => {
-              try {
-                const msgString = message.toString();
-                // console.log(`[AirQuality] 📩 Received msg on ${topic}: ${msgString.substring(0, 50)}...`);
-
-                const data = JSON.parse(msgString);
-                if (topic === 'sut/app/bus/location') {
-                  // Handle both server-bridged data and direct ESP32 data
-                  // console.log(`[AirQuality] 📡 Received sensor data on ${topic}:`,
-                  //   `PM2.5=${data.pm2_5}, PM10=${data.pm10}, Temp=${data.temp}, Hum=${data.hum}`);
-                  setBuses(prevBuses => {
-                    const index = prevBuses.findIndex(b => b.bus_mac === data.bus_mac || b.mac_address === data.bus_mac);
-                    let updatedBuses;
-
-                    if (index > -1) {
-                      //  console.log(`[AirQuality] 🔄 Updating bus ${data.bus_mac}`);
-                      updatedBuses = [...prevBuses];
-                      updatedBuses[index] = {
-                        ...updatedBuses[index],
-                        id: data.bus_mac,
-                        bus_mac: data.bus_mac,
-                        mac_address: data.bus_mac,
-                        // Only update fields if they are present in the payload (avoid overwriting with null)
-                        current_lat: (data.lat !== undefined && data.lat !== null) ? data.lat : updatedBuses[index].current_lat,
-                        current_lon: (data.lon !== undefined && data.lon !== null) ? data.lon : updatedBuses[index].current_lon,
-                        pm2_5: (data.pm2_5 !== undefined && data.pm2_5 !== null) ? data.pm2_5 : updatedBuses[index].pm2_5,
-                        pm10: (data.pm10 !== undefined && data.pm10 !== null) ? data.pm10 : updatedBuses[index].pm10,
-                        temp: (data.temp !== undefined && data.temp !== null) ? data.temp : updatedBuses[index].temp,
-                        hum: (data.hum !== undefined && data.hum !== null) ? data.hum : updatedBuses[index].hum,
-                      };
-                    } else {
-                      console.log(`[AirQuality] ➕ Adding new bus ${data.bus_mac}`);
-                      updatedBuses = [...prevBuses, {
-                        id: data.bus_mac,
-                        bus_mac: data.bus_mac,
-                        mac_address: data.bus_mac,
-                        bus_name: data.bus_name || `Bus-${data.bus_mac.slice(-5)}`,
-                        current_lat: data.lat,
-                        current_lon: data.lon,
-                        pm2_5: data.pm2_5,
-                        pm10: data.pm10,
-                        temp: data.temp,
-                        hum: data.hum,
-                      }];
-                    }
-                    return updatedBuses;
-                  });
-
-                  handleDirectionUpdate(data);
-                } else if (topic === 'sut/bus/gps/fast') {
-                  // Fast GPS-only update (lat, lon only - every 500ms)
-                  setBuses(prevBuses => {
-                    const idx = prevBuses.findIndex(b => b.bus_mac === data.bus_mac || b.mac_address === data.bus_mac);
-                    if (idx > -1 && data.lat != null && data.lon != null) {
-                      const updated = [...prevBuses];
-                      updated[idx] = {
-                        ...updated[idx],
-                        current_lat: data.lat,
-                        current_lon: data.lon
-                      };
-                      return updated;
-                    }
-                    return prevBuses;
-                  });
-                  handleDirectionUpdate(data);
-                }
-              } catch (e) {
-                console.error('[AirQuality] ❌ Error parsing MQTT message:', e);
-              }
-            });
-
-            client.on('error', (err) => {
-              console.error('[AirQuality] ❌ MQTT Client Error:', err);
-            });
-
-            client.on('close', () => {
-              console.log('[AirQuality] ❌ MQTT Connection Closed');
-            });
-
-          } else {
-            console.error('[AirQuality] ❌ mqtt.connect is not a function');
-          }
-        } catch (e) {
-          console.error("[AirQuality] ❌ Failed to initialize MQTT:", e);
-        }
-      }
-    };
-
-
-    connectMqtt();
+    // POLLING MECHANISM (HTTP-Only Mode)
+    // Replace MQTT with 2-second interval polling
+    const pollInterval = setInterval(() => {
+      fetchBusesAPI();
+    }, 2000);
 
     return () => {
-      if (client) {
-        client.end();
-      }
-      // clearInterval(interval); // No cleanup for interval needed as we removed it
+      clearInterval(pollInterval);
     };
-  }, [serverIp]); // Re-run when serverIp changes
+  }, [fetchBusesAPI]);
 
   const getLocation = async () => {
     try {
@@ -365,50 +298,7 @@ const AirQualityScreen = () => {
     }
   };
 
-  const renderBusItem = ({ item }) => {
-    const { status, solidColor } = getAirQualityStatus(item.pm2_5);
-    const hasDestination = destinationMarkers[item.mac_address];
 
-    return (
-      <TouchableOpacity
-        style={styles.card}
-        onPress={() => zoomToBus(item)}
-        activeOpacity={0.7}
-      >
-        <View style={styles.cardHeader}>
-          <Text style={styles.busName}>{item.bus_name || `Bus ${item.mac_address.slice(-5)}`}</Text>
-          <View style={{ flexDirection: 'row', gap: 5 }}>
-            {hasDestination && (
-              <TouchableOpacity
-                style={[styles.statusBadge, { backgroundColor: '#F57C00' }]}
-                onPress={() => {
-                  setDestinationMarkers(prev => {
-                    const updated = { ...prev };
-                    delete updated[item.mac_address];
-                    return updated;
-                  });
-                }}
-              >
-                <Text style={{ color: '#fff', fontSize: 10 }}>📍 Clear</Text>
-              </TouchableOpacity>
-            )}
-            <Text style={[styles.statusBadge, { backgroundColor: solidColor }]}>{status}</Text>
-          </View>
-        </View>
-        <View style={styles.cardBody}>
-          <Text style={styles.metric}>PM2.5: <Text style={styles.bold}>{item.pm2_5 !== undefined && item.pm2_5 !== null ? item.pm2_5.toFixed(1) : '--'}</Text> µg/m³</Text>
-          <Text style={styles.metric}>PM10: <Text style={styles.bold}>{item.pm10 !== undefined && item.pm10 !== null ? item.pm10.toFixed(1) : '--'}</Text> µg/m³</Text>
-        </View>
-        <View style={[styles.cardBody, { marginTop: 5 }]}>
-          <Text style={styles.metric}>Temp: <Text style={styles.bold}>{item.temp !== undefined && item.temp !== null ? item.temp.toFixed(1) : '--'}</Text> °C</Text>
-          <Text style={styles.metric}>Hum: <Text style={styles.bold}>{item.hum !== undefined && item.hum !== null ? item.hum.toFixed(0) : '--'}</Text> %</Text>
-        </View>
-        {hasDestination && (
-          <Text style={styles.destinationText}>🎯 Destination set</Text>
-        )}
-      </TouchableOpacity>
-    );
-  };
 
   if (Platform.OS === 'web') {
     return (

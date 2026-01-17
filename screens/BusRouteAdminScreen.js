@@ -10,11 +10,12 @@ import { Ionicons } from '@expo/vector-icons';
 import axios from 'axios';
 
 import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
-import { getAllRoutes, syncAllRoutesToServer } from '../utils/routeStorage';
+import { getAllRoutes, syncAllRoutesToServer, deleteRoute, deleteRouteFromServer } from '../utils/routeStorage';
 import { getAllMappings, assignRouteToBus } from '../utils/busRouteMapping';
 
 const BusRouteAdminScreen = () => {
     const navigation = useNavigation();
+    const [activeTab, setActiveTab] = useState('assignments'); // 'assignments' | 'routes'
     const [buses, setBuses] = useState([]);
     const [routes, setRoutes] = useState([]);
     const [mappings, setMappings] = useState({});
@@ -35,31 +36,13 @@ const BusRouteAdminScreen = () => {
                     timeout: 5000
                 });
                 if (busResponse.data && Array.isArray(busResponse.data)) {
-                    // Add fake test bus for debugging
-                    const fakeBus = {
-                        id: 'FAKE-BUS-TEST',
-                        bus_mac: 'FAKE-BUS-TEST',
-                        bus_name: '🧪 Fake Test Bus',
-                        isFake: true
-                    };
-                    setBuses([...busResponse.data, fakeBus]);
+                    setBuses(busResponse.data);
                 } else {
-                    // Still add fake bus even if no real buses
-                    setBuses([{
-                        id: 'FAKE-BUS-TEST',
-                        bus_mac: 'FAKE-BUS-TEST',
-                        bus_name: '🧪 Fake Test Bus',
-                        isFake: true
-                    }]);
+                    setBuses([]);
                 }
             } catch (e) {
-                console.log('Could not fetch buses from server, using fake bus only');
-                setBuses([{
-                    id: 'FAKE-BUS-TEST',
-                    bus_mac: 'FAKE-BUS-TEST',
-                    bus_name: '🧪 Fake Test Bus',
-                    isFake: true
-                }]);
+                console.log('Could not fetch buses from server', e);
+                setBuses([]);
             }
 
             // Fetch local routes
@@ -127,7 +110,42 @@ const BusRouteAdminScreen = () => {
         }
     };
 
+    // Handle Delete Route
+    const handleDeleteRoute = (route) => {
+        Alert.alert(
+            "Delete Route",
+            `Are you sure you want to delete "${route.routeName}"? This will remove it from both local storage and the server.`,
+            [
+                { text: "Cancel", style: "cancel" },
+                {
+                    text: "Delete",
+                    style: "destructive",
+                    onPress: async () => {
+                        setLoading(true);
+                        try {
+                            // 1. Delete Local
+                            await deleteRoute(route.routeId);
+
+                            // 2. Delete Server
+                            await deleteRouteFromServer(route.routeId);
+
+                            Alert.alert("Success", "Route deleted successfully");
+                            loadData(); // Reload list
+                        } catch (e) {
+                            console.error("Delete error:", e);
+                            Alert.alert("Error", "Failed to delete route");
+                        } finally {
+                            setLoading(false);
+                        }
+                    }
+                }
+            ]
+        );
+    };
+
     const getBusMac = (bus) => bus.bus_mac || bus.mac_address || bus.id;
+
+    // --- Renders ---
 
     const renderBusItem = ({ item: bus }) => {
         const busMac = getBusMac(bus);
@@ -164,11 +182,29 @@ const BusRouteAdminScreen = () => {
         );
     };
 
+    const renderRouteItem = ({ item: route }) => (
+        <View style={styles.routeItem}>
+            <View style={styles.routeInfo}>
+                <Ionicons name="map" size={24} color="#10b981" />
+                <View style={styles.routeDetails}>
+                    <Text style={styles.routeName}>{route.routeName}</Text>
+                    <Text style={styles.routeId}>{route.waypoints?.length || 0} stops • ID: {route.routeId.slice(0, 8)}...</Text>
+                </View>
+            </View>
+            <TouchableOpacity
+                style={styles.deleteBtn}
+                onPress={() => handleDeleteRoute(route)}
+            >
+                <Ionicons name="trash-outline" size={20} color="#ef4444" />
+            </TouchableOpacity>
+        </View>
+    );
+
     if (loading) {
         return (
             <SafeAreaView style={styles.loadingContainer}>
                 <ActivityIndicator size="large" color="#2563eb" />
-                <Text style={styles.loadingText}>Loading buses and routes...</Text>
+                <Text style={styles.loadingText}>Loading data...</Text>
             </SafeAreaView>
         );
     }
@@ -180,70 +216,91 @@ const BusRouteAdminScreen = () => {
                 <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
                     <Ionicons name="arrow-back" size={24} color="#333" />
                 </TouchableOpacity>
-                <Text style={styles.title}>Bus Route Assignment</Text>
+                <Text style={styles.title}>Route Admin</Text>
                 <View style={styles.headerButtons}>
-                    <TouchableOpacity
-                        onPress={handleSyncToServer}
-                        style={[styles.syncButton, syncing && styles.syncButtonDisabled]}
-                        disabled={syncing}
-                    >
-                        {syncing ? (
-                            <ActivityIndicator size="small" color="#fff" />
-                        ) : (
-                            <>
-                                <Ionicons name="cloud-upload" size={18} color="#fff" />
-                                <Text style={styles.syncButtonText}>Sync</Text>
-                            </>
-                        )}
-                    </TouchableOpacity>
                     <TouchableOpacity onPress={loadData} style={styles.refreshButton}>
                         <Ionicons name="refresh" size={24} color="#2563eb" />
                     </TouchableOpacity>
                 </View>
             </View>
 
-            {/* Info Banner */}
-            <View style={styles.infoBanner}>
-                <Ionicons name="information-circle" size={20} color="#0066cc" />
-                <Text style={styles.infoText}>
-                    Assign routes to buses. Tap "Sync" to share routes with all users.
-                </Text>
+            {/* Tabs */}
+            <View style={styles.tabContainer}>
+                <TouchableOpacity
+                    style={[styles.tab, activeTab === 'assignments' && styles.activeTab]}
+                    onPress={() => setActiveTab('assignments')}
+                >
+                    <Text style={[styles.tabText, activeTab === 'assignments' && styles.activeTabText]}>Bus Assignments</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                    style={[styles.tab, activeTab === 'routes' && styles.activeTab]}
+                    onPress={() => setActiveTab('routes')}
+                >
+                    <Text style={[styles.tabText, activeTab === 'routes' && styles.activeTabText]}>Manage Routes</Text>
+                </TouchableOpacity>
             </View>
 
-            {/* Stats */}
-            <View style={styles.statsRow}>
-                <View style={styles.statBox}>
-                    <Text style={styles.statNumber}>{buses.length}</Text>
-                    <Text style={styles.statLabel}>Buses</Text>
-                </View>
-                <View style={styles.statBox}>
-                    <Text style={styles.statNumber}>{routes.length}</Text>
-                    <Text style={styles.statLabel}>Routes</Text>
-                </View>
-                <View style={styles.statBox}>
-                    <Text style={styles.statNumber}>{Object.keys(mappings).length}</Text>
-                    <Text style={styles.statLabel}>Assigned</Text>
-                </View>
+            {/* Content */}
+            <View style={styles.content}>
+                {activeTab === 'assignments' ? (
+                    <>
+                        <View style={styles.infoBanner}>
+                            <Ionicons name="information-circle" size={20} color="#0066cc" />
+                            <Text style={styles.infoText}>
+                                Assign routes to buses below.
+                            </Text>
+                        </View>
+                        {buses.length === 0 ? (
+                            <View style={styles.emptyState}>
+                                <Ionicons name="bus-outline" size={48} color="#ccc" />
+                                <Text style={styles.emptyText}>No buses found</Text>
+                            </View>
+                        ) : (
+                            <FlatList
+                                data={buses}
+                                keyExtractor={(item, index) => getBusMac(item) || `bus-${index}`}
+                                renderItem={renderBusItem}
+                                contentContainerStyle={styles.listContent}
+                                showsVerticalScrollIndicator={false}
+                            />
+                        )}
+                    </>
+                ) : (
+                    <>
+                        <View style={[styles.infoBanner, { backgroundColor: '#f0fdf4' }]}>
+                            <Ionicons name="cloud-upload-outline" size={20} color="#15803d" />
+                            <Text style={[styles.infoText, { color: '#15803d' }]}>
+                                Manage your routes here.
+                            </Text>
+                            <TouchableOpacity
+                                onPress={handleSyncToServer}
+                                style={[styles.syncButton, syncing && styles.syncButtonDisabled]}
+                                disabled={syncing}
+                            >
+                                {syncing ? (
+                                    <ActivityIndicator size="small" color="#fff" />
+                                ) : (
+                                    <Text style={styles.syncButtonText}>Sync to Server</Text>
+                                )}
+                            </TouchableOpacity>
+                        </View>
+                        {routes.length === 0 ? (
+                            <View style={styles.emptyState}>
+                                <Ionicons name="map-outline" size={48} color="#ccc" />
+                                <Text style={styles.emptyText}>No routes found</Text>
+                            </View>
+                        ) : (
+                            <FlatList
+                                data={routes}
+                                keyExtractor={(item) => item.routeId}
+                                renderItem={renderRouteItem}
+                                contentContainerStyle={styles.listContent}
+                                showsVerticalScrollIndicator={false}
+                            />
+                        )}
+                    </>
+                )}
             </View>
-
-            {/* Bus List */}
-            {buses.length === 0 ? (
-                <View style={styles.emptyState}>
-                    <Ionicons name="bus-outline" size={48} color="#ccc" />
-                    <Text style={styles.emptyText}>No buses found</Text>
-                    <Text style={styles.emptySubtext}>
-                        Make sure the server is running and buses are registered
-                    </Text>
-                </View>
-            ) : (
-                <FlatList
-                    data={buses}
-                    keyExtractor={(item, index) => getBusMac(item) || `bus-${index}`}
-                    renderItem={renderBusItem}
-                    contentContainerStyle={styles.listContent}
-                    showsVerticalScrollIndicator={false}
-                />
-            )}
         </SafeAreaView>
     );
 };
@@ -259,10 +316,7 @@ const styles = StyleSheet.create({
         alignItems: 'center',
         backgroundColor: '#f5f5f5',
     },
-    loadingText: {
-        marginTop: 10,
-        color: '#666',
-    },
+    loadingText: { marginTop: 10, color: '#666' },
     header: {
         flexDirection: 'row',
         alignItems: 'center',
@@ -273,9 +327,7 @@ const styles = StyleSheet.create({
         borderBottomWidth: 1,
         borderBottomColor: '#eee',
     },
-    backButton: {
-        padding: 4,
-    },
+    backButton: { padding: 4 },
     title: {
         fontSize: 18,
         fontWeight: 'bold',
@@ -286,25 +338,35 @@ const styles = StyleSheet.create({
         alignItems: 'center',
         gap: 8,
     },
-    syncButton: {
+    refreshButton: { padding: 4 },
+    tabContainer: {
         flexDirection: 'row',
+        backgroundColor: '#fff',
+        paddingHorizontal: 16,
+        paddingBottom: 0,
+        borderBottomWidth: 1,
+        borderBottomColor: '#eee',
+    },
+    tab: {
+        flex: 1,
+        paddingVertical: 12,
         alignItems: 'center',
-        backgroundColor: '#10b981',
-        paddingHorizontal: 12,
-        paddingVertical: 6,
-        borderRadius: 16,
-        gap: 4,
+        borderBottomWidth: 3,
+        borderBottomColor: 'transparent',
     },
-    syncButtonDisabled: {
-        backgroundColor: '#9ca3af',
+    activeTab: {
+        borderBottomColor: '#2563eb',
     },
-    syncButtonText: {
-        color: '#fff',
-        fontSize: 13,
+    tabText: {
+        fontSize: 14,
         fontWeight: '600',
+        color: '#666',
     },
-    refreshButton: {
-        padding: 4,
+    activeTabText: {
+        color: '#2563eb',
+    },
+    content: {
+        flex: 1,
     },
     infoBanner: {
         flexDirection: 'row',
@@ -321,29 +383,26 @@ const styles = StyleSheet.create({
         fontSize: 13,
         flex: 1,
     },
-    statsRow: {
-        flexDirection: 'row',
-        justifyContent: 'space-around',
-        paddingVertical: 16,
-        marginHorizontal: 16,
+    syncButton: {
+        backgroundColor: '#10b981',
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 16,
     },
-    statBox: {
-        alignItems: 'center',
+    syncButtonDisabled: {
+        backgroundColor: '#9ca3af',
     },
-    statNumber: {
-        fontSize: 24,
-        fontWeight: 'bold',
-        color: '#2563eb',
-    },
-    statLabel: {
+    syncButtonText: {
+        color: '#fff',
         fontSize: 12,
-        color: '#666',
-        marginTop: 2,
+        fontWeight: '600',
     },
     listContent: {
         paddingHorizontal: 16,
         paddingBottom: 20,
+        paddingTop: 12,
     },
+    // Bus Items
     busItem: {
         backgroundColor: '#fff',
         borderRadius: 12,
@@ -360,20 +419,9 @@ const styles = StyleSheet.create({
         alignItems: 'center',
         marginBottom: 12,
     },
-    busDetails: {
-        marginLeft: 12,
-    },
-    busName: {
-        fontSize: 16,
-        fontWeight: '600',
-        color: '#333',
-    },
-    busMac: {
-        fontSize: 12,
-        color: '#888',
-        fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-        marginTop: 2,
-    },
+    busDetails: { marginLeft: 12 },
+    busName: { fontSize: 16, fontWeight: '600', color: '#333' },
+    busMac: { fontSize: 12, color: '#888', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', marginTop: 2 },
     pickerContainer: {
         backgroundColor: '#f9f9f9',
         borderRadius: 8,
@@ -381,14 +429,41 @@ const styles = StyleSheet.create({
         borderColor: '#ddd',
         overflow: 'hidden',
     },
-    picker: {
-        height: 50,
+    picker: { height: 50 },
+    // Route Items
+    routeItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#fff',
+        borderRadius: 12,
+        padding: 16,
+        marginBottom: 12,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.1,
+        shadowRadius: 2,
+        elevation: 2,
     },
+    routeInfo: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        flex: 1,
+    },
+    routeDetails: { marginLeft: 12 },
+    routeName: { fontSize: 16, fontWeight: '600', color: '#333' },
+    routeId: { fontSize: 12, color: '#888', marginTop: 2 },
+    deleteBtn: {
+        padding: 8,
+        backgroundColor: '#fee2e2',
+        borderRadius: 8,
+    },
+    // Empty State
     emptyState: {
         flex: 1,
         justifyContent: 'center',
         alignItems: 'center',
         paddingHorizontal: 40,
+        marginTop: 40,
     },
     emptyText: {
         fontSize: 18,
@@ -396,12 +471,7 @@ const styles = StyleSheet.create({
         color: '#666',
         marginTop: 12,
     },
-    emptySubtext: {
-        fontSize: 14,
-        color: '#999',
-        textAlign: 'center',
-        marginTop: 8,
-    },
+
 });
 
 export default BusRouteAdminScreen;
