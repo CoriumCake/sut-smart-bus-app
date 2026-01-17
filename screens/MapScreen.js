@@ -145,6 +145,8 @@ if (Platform.OS !== 'web') {
   }
 }
 
+import PMZoneMarker from '../components/PMZoneMarker';
+
 let client = null;
 
 const MapScreen = () => {
@@ -178,6 +180,10 @@ const MapScreen = () => {
   // Debug Location Override - allows testing anywhere by faking user position
   const [debugLocationEnabled, setDebugLocationEnabled] = useState(false);
   const [debugLocation, setDebugLocation] = useState(null); // {latitude, longitude}
+
+  // PM Zone Management
+  const [pmZones, setPmZones] = useState([]);
+  const [isAddingZone, setIsAddingZone] = useState(false);
 
   // Fake Bus for testing proximity boarding
   const [fakeBusEnabled, setFakeBusEnabled] = useState(false);
@@ -741,6 +747,21 @@ const MapScreen = () => {
     // Auto-refresh buses every 5s if not using MQTT
     const interval = setInterval(fetchBuses, 5000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Fetch PM Zones on mount and refresh periodically
+  const fetchPmZones = async () => {
+    try {
+      const url = await getApiUrl();
+      const response = await axios.get(`${url}/api/pm-zones`);
+      setPmZones(response.data);
+    } catch (error) {
+      console.log('Error fetching PM Zones:', error);
+    }
+  };
+
+  useEffect(() => {
+    fetchPmZones();
   }, []);
 
   // Load all routes on mount for displaying all stops
@@ -1422,9 +1443,47 @@ const MapScreen = () => {
   };
 
   const handleMapPress = (e) => {
+    // 1. PM Zone Editing Mode (Debug Only)
+    if (debugMode && isAddingZone) {
+      const { latitude, longitude } = e.nativeEvent.coordinate;
+
+      Alert.prompt(
+        "New PM Zone",
+        "Enter name for this zone:",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Create",
+            onPress: async (name) => {
+              if (name) {
+                try {
+                  const url = await getApiUrl();
+                  await axios.post(`${url}/api/pm-zones`, {
+                    name,
+                    lat: latitude,
+                    lon: longitude,
+                    radius: 50
+                  });
+                  fetchPmZones();
+                  setIsAddingZone(false); // Exit mode after creation
+                  Alert.alert("Success", "PM Zone created!");
+                } catch (err) {
+                  Alert.alert("Error", "Failed to create zone");
+                }
+              }
+            }
+          }
+        ]
+      );
+      return; // Stop other map interactions
+    }
+
+    // 2. Path Drawing Mode
     if (pathMode) {
       setWaypoints([...waypoints, e.nativeEvent.coordinate]);
-    } else if (!ridingBus) {
+    }
+    // 3. General Map interactions
+    else if (!ridingBus) {
       // Only clear highlights when NOT riding a bus
       // When riding, keep the route tracking active
       // Check activeRoute directly for more reliable detection
@@ -1441,6 +1500,7 @@ const MapScreen = () => {
         }
       }
     }
+
     // If ridingBus is set, do nothing - keep route tracking
   };
 
@@ -2155,6 +2215,39 @@ const MapScreen = () => {
 
       {showGrid && <GridOverlay />}
 
+      {/* PM Zone Markers */}
+      {pmZones.map((zone) => (
+        <PMZoneMarker
+          key={zone._id || zone.id}
+          zone={zone}
+          isEditing={debugMode}
+          onPress={(z) => {
+            if (debugMode) {
+              Alert.alert(
+                "Manage Zone",
+                `Last Updated: ${z.last_updated ? new Date(z.last_updated).toLocaleTimeString() : 'Never'}`,
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Delete",
+                    style: "destructive",
+                    onPress: async () => {
+                      try {
+                        const url = await getApiUrl();
+                        await axios.delete(`${url}/api/pm-zones/${z._id || z.id}`);
+                        fetchPmZones();
+                      } catch (e) {
+                        Alert.alert("Error", "Could not delete zone");
+                      }
+                    }
+                  }
+                ]
+              )
+            }
+          }}
+        />
+      ))}
+
       {/* Debug Controls */}
       {debugMode && (
         <View style={styles.debugControls}>
@@ -2278,6 +2371,24 @@ const MapScreen = () => {
                     {debugLocationEnabled && (
                       <Text style={{ fontSize: 10, color: '#666', marginTop: 5 }}>
                         Drag the blue person marker on map
+                      </Text>
+                    )}
+                  </View>
+
+                  {/* PM Zone Editor (Appears in Debug Panel) */}
+                  <View style={{ marginBottom: 15, borderTopWidth: 1, borderColor: '#eee', paddingTop: 10 }}>
+                    <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>🌩️ PM Zones</Text>
+                    <TouchableOpacity
+                      style={[styles.actionBtn, { backgroundColor: isAddingZone ? '#f97316' : '#22c55e' }]}
+                      onPress={() => setIsAddingZone(!isAddingZone)}
+                    >
+                      <Text style={styles.actionBtnText}>
+                        {isAddingZone ? 'Cancel Adding' : 'Add PM Zone'}
+                      </Text>
+                    </TouchableOpacity>
+                    {isAddingZone && (
+                      <Text style={{ fontSize: 10, color: '#666', marginTop: 5 }}>
+                        Tap anywhere on map to create a zone
                       </Text>
                     )}
                   </View>

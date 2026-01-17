@@ -435,6 +435,32 @@ const AirQualityScreen = () => {
           onLongPress={handleLongPress}
           onZoomToLocation={zoomToLocation}
         />
+
+        {/* PM Zone Editor Launch Button */}
+        {debugMode && (
+          <TouchableOpacity
+            style={{
+              position: 'absolute',
+              bottom: 40,
+              left: 20,
+              backgroundColor: '#ef4444',
+              borderRadius: 50,
+              width: 50,
+              height: 50,
+              justifyContent: 'center',
+              alignItems: 'center',
+              elevation: 5,
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.25,
+              shadowRadius: 3.84,
+              zIndex: 1000
+            }}
+            onPress={() => navigation.navigate('PMZoneEditor')}
+          >
+            <Ionicons name="map" size={24} color="white" />
+          </TouchableOpacity>
+        )}
       </View>
 
       {debugMode && (

@@ -20,6 +20,7 @@ import BusRouteAdminScreen from './screens/BusRouteAdminScreen';
 import BusManagementScreen from './screens/BusManagementScreen';
 import AirQualityDashboardScreen from './screens/AirQualityDashboardScreen';
 import AboutScreen from './screens/AboutScreen';
+import PMZoneEditorScreen from './screens/PMZoneEditorScreen';
 import { createStackNavigator } from '@react-navigation/stack';
 import { loadDefaultRoutes } from './utils/defaultRoutes';
 import { fetchAndSyncMappings } from './utils/busRouteMapping';
@@ -74,6 +75,7 @@ const AppNavigator = () => {
       <Stack.Screen name="BusManagement" component={BusManagementScreen} />
       <Stack.Screen name="AirQualityDashboard" component={AirQualityDashboardScreen} />
       <Stack.Screen name="About" component={AboutScreen} />
+      <Stack.Screen name="PMZoneEditor" component={PMZoneEditorScreen} />
     </Stack.Navigator>
   );
 };
