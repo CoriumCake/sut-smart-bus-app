@@ -2,37 +2,47 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, FlatList, StyleSheet, TouchableOpacity, Alert, Platform, RefreshControl } from 'react-native';
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-// import * as mqtt from 'mqtt'; // MQTT Removed for HTTP Mode
 import { API_BASE, getApiUrl, checkApiKey, getApiHeaders } from '../config/api';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
-import { useTheme } from '../contexts/ThemeContext';
-import { useDebug } from '../contexts/DebugContext';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { useDebug } from '../contexts/DebugContext';
+import { useTheme } from '../contexts/ThemeContext';
+import { useLanguage } from '../contexts/LanguageContext';
+import { useData } from '../contexts/DataContext'; // <-- ADDED
+
+import { getAllRoutes, loadRoute, downloadRoutesFromServer } from '../utils/routeStorage';
+import { getAllMappings, getRouteIdForBus } from '../utils/busRouteMapping';
 import { findNextStop } from '../utils/routeHelpers';
 
-// MQTT client for real-time bus detection
-// let mqttClient = null;
-
 const RoutesScreen = () => {
-  const [buses, setBuses] = useState([]);
-  const [busRoutes, setBusRoutes] = useState({});
+  const { buses, refreshBuses } = useData(); // Consume Global Data
+  const [busRoutes, setBusRoutes] = useState({}); // { busMac: { route, nextStop } }
   const [refreshing, setRefreshing] = useState(false);
-  const [localRoutes, setLocalRoutes] = useState([]); // Saved routes for debug
-
+  const [localRoutes, setLocalRoutes] = useState([]); // For debug mode route management
   const navigation = useNavigation();
-  const { theme, isDark } = useTheme();
   const { debugMode } = useDebug();
-
-  // Polling for passenger count (to keep consistent with other screens if needed)
+  const { theme } = useTheme();
+  const { t } = useLanguage();
   const [passengerCount, setPassengerCount] = useState(0);
 
+  // Force re-render periodically for offline status
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setTick(t => t + 1), 10000); // 10s check
+    return () => clearInterval(interval);
+  }, []);
+
+  // Fetch passenger count from API
   useEffect(() => {
     const fetchCount = async () => {
       try {
-        const response = await axios.get(`${API_BASE}/count`, { headers: getApiHeaders() });
-        if (response.data && response.data.passengers !== undefined) {
-          setPassengerCount(response.data.passengers);
+        const response = await fetch(`${API_BASE}/count`, { headers: getApiHeaders() });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.passengers !== undefined) {
+            setPassengerCount(data.passengers);
+          }
         }
       } catch (err) {
         // Silent fail
@@ -43,93 +53,55 @@ const RoutesScreen = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // POLLING MECHANISM (HTTP-Only Mode)
+  // Load mappings and calculate next stops whenever BUSES change
   useEffect(() => {
-    // Initial load
-    loadData();
-
-    const interval = setInterval(() => {
-      loadData(false);
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  // Track if we've already synced routes this session
-  const hasInitiallyLoaded = useRef(false);
-
-  // Load buses and their assigned routes
-  const loadData = useCallback(async (forceServerSync = false) => {
-    try {
-      // Only sync from server on first load or manual refresh
-      // This prevents unnecessary network calls when navigating back
-      if (!hasInitiallyLoaded.current || forceServerSync) {
-        await downloadRoutesFromServer();
-        hasInitiallyLoaded.current = true;
-      }
-
-      // Fetch buses from server
-      const apiKey = await checkApiKey();
-      const apiUrl = await getApiUrl();
-
-      let fetchedBuses = [];
+    const calculateBusRoutes = async () => {
       try {
-        const response = await axios.get(`${apiUrl}/api/buses`, {
-          headers: getApiHeaders(),
-          timeout: 5000
-        });
-        if (response.data && Array.isArray(response.data)) {
-          fetchedBuses = response.data.map(b => ({ ...b, last_updated: Date.now() }));
-        }
-      } catch (e) {
-        console.log('Could not fetch buses (server offline)');
-      }
+        const mappings = await getAllMappings();
+        const routeDataMap = {};
 
-      setBuses(fetchedBuses);
+        for (const bus of buses) {
+          const busMac = bus.bus_mac || bus.mac_address || bus.id;
+          const routeId = mappings[busMac];
 
-      // Load route mappings and route data for each bus
-      const mappings = await getAllMappings();
-      const routeDataMap = {};
+          if (routeId) {
+            const route = await loadRoute(routeId);
+            if (route) {
+              const busLat = bus.current_lat || bus.lat;
+              const busLon = bus.current_lon || bus.lon;
+              const nextStop = findNextStop(busLat, busLon, route.waypoints);
 
-
-      for (const bus of fetchedBuses) {
-        const busMac = bus.bus_mac || bus.mac_address || bus.id;
-        const routeId = mappings[busMac];
-
-        if (routeId) {
-          const route = await loadRoute(routeId);
-          if (route) {
-            const busLat = bus.current_lat || bus.lat;
-            const busLon = bus.current_lon || bus.lon;
-            const nextStop = findNextStop(busLat, busLon, route.waypoints);
-
-            routeDataMap[busMac] = {
-              route,
-              nextStop,
-            };
+              routeDataMap[busMac] = {
+                route,
+                nextStop,
+              };
+            }
           }
         }
+        setBusRoutes(routeDataMap);
+      } catch (error) {
+        console.error('[RoutesScreen] Error calculating routes:', error);
       }
+    };
 
-      setBusRoutes(routeDataMap);
+    calculateBusRoutes();
+  }, [buses]); // Re-run when context data updates
 
-      // Also load local routes for debug mode
-      const savedRoutes = await getAllRoutes();
-      setLocalRoutes(savedRoutes);
-    } catch (error) {
-      console.error('Error loading data:', error);
-    }
-  }, []);
-
+  // Load local saved routes (for debug list)
   useFocusEffect(
     useCallback(() => {
-      loadData();
-    }, [loadData])
+      const loadSavedRoutes = async () => {
+        const saved = await getAllRoutes();
+        setLocalRoutes(saved);
+      };
+      loadSavedRoutes();
+    }, [])
   );
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await loadData(true); // Force server sync on manual refresh
+    await refreshBuses(); // Refresh Context
+    await downloadRoutesFromServer(); // Sync routes
     setRefreshing(false);
   };
 
@@ -151,7 +123,8 @@ const RoutesScreen = () => {
     const nextStop = routeData?.nextStop;
 
     // Offline check > 60s
-    const isOffline = bus.last_updated && (Date.now() - bus.last_updated > 60000);
+    // Use (bus.last_updated || 0) to handle null/undefined/0.
+    const isOffline = (Date.now() - (bus.last_updated || 0)) > 60000;
     const opacity = isOffline ? 0.5 : 1.0;
 
     return (

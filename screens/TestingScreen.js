@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, TextInput, Platform, ScrollView, Image } from 'react-native';
 import { WebView } from 'react-native-webview';
-// import * as mqtt from 'mqtt'; // Removed
+import * as mqtt from 'mqtt';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useDebug } from '../contexts/DebugContext';
 import { useServerConfig } from '../hooks/useServerConfig';
@@ -22,7 +22,7 @@ const TestingScreen = () => {
   const [statusMessage, setStatusMessage] = useState('Waiting for data...');
   const [imageRefresh, setImageRefresh] = useState(0);
   const [imageStatus, setImageStatus] = useState('Loading...');
-  // const [mqttStatus, setMqttStatus] = useState('Disconnected'); // Removed
+  const [mqttStatus, setMqttStatus] = useState('Disconnected');
 
   // Double Buffering State
   const [activeBuffer, setActiveBuffer] = useState(0); // 0 or 1
@@ -99,8 +99,114 @@ const TestingScreen = () => {
     return () => clearInterval(interval);
   }, [serverIp]);
 
-  // MQTT Logic Removed
-  // useEffect(() => { ... }, []);
+  // MQTT Logic
+  useEffect(() => {
+    const connectMqtt = async () => {
+      if (Platform.OS !== 'web') {
+        try {
+          const mqttUrl = `ws://${serverIp}:9001/`;
+          console.log(`DEBUG: Attempting to connect to MQTT at ${mqttUrl}`);
+
+          if (mqtt && typeof mqtt.connect === 'function') {
+            const options = {
+              clientId: `app_${Math.random().toString(16).slice(2, 10)}`,
+              reconnectPeriod: 5000,
+              keepalive: 60,
+              clean: false,
+              protocolVersion: 4,
+            };
+
+            const client = mqtt.connect(mqttUrl, options);
+            mqttClientRef.current = client;
+
+            client.on('connect', () => {
+              console.log('✅ Connected to MQTT Broker successfully');
+              setMqttStatus('Connected');
+              setStatusMessage('Connected to Real-time Updates');
+              client.subscribe('sut/person-detection', (err) => {
+                if (err) console.error('❌ Subscription error:', err);
+              });
+              client.subscribe('sut/camera/update', (err) => {
+                if (err) console.error('❌ Subscription error (cam):', err);
+              });
+              // Subscribe to Quality Sync
+              client.subscribe('sut/bus/ESP32-CAM-01/quality', (err) => {
+                if (err) console.error('❌ Subscription error (quality):', err);
+              });
+            });
+
+            client.on('reconnect', () => {
+              setMqttStatus('Reconnecting');
+              setStatusMessage('Reconnecting...');
+            });
+
+            client.on('offline', () => {
+              setMqttStatus('Offline');
+              setStatusMessage('MQTT Offline');
+            });
+
+            client.on('message', (topic, message) => {
+              if (topic === 'sut/person-detection') {
+                try {
+                  const data = JSON.parse(message.toString());
+                  // console.log('Received real-time detection:', data); // Reduced logs
+                  setVideoResult(data);
+                  setStatusMessage(`Last update: ${new Date().toLocaleTimeString()}`);
+                } catch (e) {
+                  console.error('Error parsing MQTT message:', e);
+                }
+              }
+              if (topic === 'sut/camera/update') {
+                // Calculate Real FPS based on server events
+                const now = Date.now();
+                if (lastFrameTime.current > 0) {
+                  const delta = now - lastFrameTime.current;
+                  if (delta > 0) {
+                    const currentFps = 1000 / delta;
+                    setFps(prev => (prev * 0.9 + currentFps * 0.1).toFixed(1)); // Moving average
+                  }
+                }
+                lastFrameTime.current = now;
+              }
+              if (topic === 'sut/bus/ESP32-CAM-01/quality') {
+                // Sync Quality State
+                const val = parseInt(message.toString());
+                if (!isNaN(val)) {
+                  // Inverse Formula: val = 63 - (score - 1) * 10
+                  // score - 1 = (63 - val) / 10
+                  // score = 1 + (63 - val) / 10
+                  const syncedScore = Math.round(1 + (63 - val) / 10);
+                  setQualityScore(syncedScore);
+                  console.log(`Synced Quality: Val ${val} -> Score ${syncedScore}`);
+                }
+              }
+            });
+
+            client.on('error', (err) => {
+              console.error('❌ MQTT Error:', err);
+              setMqttStatus('Error');
+              setStatusMessage(`MQTT Error: ${err.message}`);
+            });
+
+            client.on('close', () => {
+              setMqttStatus('Disconnected');
+            });
+          }
+        } catch (e) {
+          console.error("Failed to initialize MQTT:", e);
+          setStatusMessage(`Init Error: ${e.message}`);
+        }
+      }
+    };
+
+    connectMqtt();
+
+    return () => {
+      if (mqttClientRef.current) {
+        mqttClientRef.current.end();
+      }
+    };
+  }, [serverIp]); // Re-connect if Server IP changes
 
   return (
     <SafeAreaView style={{ flex: 1 }}>
@@ -239,7 +345,13 @@ const TestingScreen = () => {
 
         <View style={styles.statsContainer}>
           <Text style={styles.subtitle}>Real-time Detection Stats</Text>
-          <Text style={styles.statusText}>Live Status: {statusMessage}</Text>
+          <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 5 }}>
+            <View style={[styles.statusDot, {
+              backgroundColor: mqttStatus === 'Connected' ? '#4CAF50' :
+                mqttStatus === 'Reconnecting' ? '#FFC107' : '#F44336'
+            }]} />
+            <Text style={styles.statusText}>MQTT: {mqttStatus} • {statusMessage}</Text>
+          </View>
 
           <View style={styles.grid}>
             <View style={styles.statBox}>
@@ -284,7 +396,7 @@ const TestingScreen = () => {
           </View>
         </View>
       </ScrollView>
-    </SafeAreaView >
+    </SafeAreaView>
   );
 };
 

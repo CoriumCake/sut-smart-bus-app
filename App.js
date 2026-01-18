@@ -2,10 +2,12 @@ import './shim';
 import 'react-native-gesture-handler';
 import React, { useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
+import { View, Text, ActivityIndicator } from 'react-native'; // <-- ADDED
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
 
+import { DataProvider, useData } from './contexts/DataContext'; // <-- ADDED useData
 import { DebugProvider, useDebug } from './contexts/DebugContext';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { LanguageProvider } from './contexts/LanguageContext';
@@ -20,7 +22,6 @@ import BusRouteAdminScreen from './screens/BusRouteAdminScreen';
 import BusManagementScreen from './screens/BusManagementScreen';
 import AirQualityDashboardScreen from './screens/AirQualityDashboardScreen';
 import AboutScreen from './screens/AboutScreen';
-import PMZoneEditorScreen from './screens/PMZoneEditorScreen';
 import { createStackNavigator } from '@react-navigation/stack';
 import { loadDefaultRoutes } from './utils/defaultRoutes';
 import { fetchAndSyncMappings } from './utils/busRouteMapping';
@@ -75,7 +76,6 @@ const AppNavigator = () => {
       <Stack.Screen name="BusManagement" component={BusManagementScreen} />
       <Stack.Screen name="AirQualityDashboard" component={AirQualityDashboardScreen} />
       <Stack.Screen name="About" component={AboutScreen} />
-      <Stack.Screen name="PMZoneEditor" component={PMZoneEditorScreen} />
     </Stack.Navigator>
   );
 };
@@ -83,6 +83,7 @@ const AppNavigator = () => {
 // Inner app that needs access to theme
 const ThemedApp = () => {
   const { theme } = useTheme();
+  const { loading } = useData(); // <-- ADDED: Check global loading state
 
   // Load default bundled routes and sync bus-route mappings on first launch
   useEffect(() => {
@@ -92,6 +93,18 @@ const ThemedApp = () => {
       if (updated) console.log('[App] Bus route mappings updated from server');
     });
   }, []);
+
+  // Show splash/loading screen while initial data is fetching
+  if (loading) {
+    return (
+      <View style={{ flex: 1, backgroundColor: theme.background, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator size="large" color={theme.primary} />
+        <Text style={{ marginTop: 20, color: theme.text, fontSize: 16, fontWeight: '500' }}>
+          Loading Smart Bus Data...
+        </Text>
+      </View>
+    );
+  }
 
   return (
     <NavigationContainer>
@@ -106,9 +119,11 @@ const App = () => (
     <LanguageProvider>
       <NotificationProvider>
         <DebugProvider>
-          <ErrorBoundary>
-            <ThemedApp />
-          </ErrorBoundary>
+          <DataProvider>
+            <ErrorBoundary>
+              <ThemedApp />
+            </ErrorBoundary>
+          </DataProvider>
         </DebugProvider>
       </NotificationProvider>
     </LanguageProvider>

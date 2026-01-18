@@ -4,20 +4,19 @@ import * as Location from 'expo-location';
 import axios from 'axios';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
-import { getApiUrl, checkApiKey, getApiHeaders, getConnectionMode } from '../config/api';
+import { getApiUrl, checkApiKey, getApiHeaders } from '../config/api'; // Removed MQTT_CONFIG, getConnectionMode
 import { useDebug } from '../contexts/DebugContext';
-import { useServerConfig } from '../hooks/useServerConfig';
+// import { useServerConfig } from '../hooks/useServerConfig'; // Removed unused hook
+import { useData } from '../contexts/DataContext'; // <-- ADDED
 import { getAirQualityStatus } from '../utils/airQuality';
 import AirQualityMap from '../components/AirQualityMap';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as mqtt from 'mqtt';
 
 
 const AirQualityScreen = () => {
   const navigation = useNavigation();
   const { debugMode } = useDebug();
-  const { serverIp } = useServerConfig(); // Use hook
-  const [buses, setBuses] = useState([]);
+  // const { serverIp } = useServerConfig(); // Removed: Not needed for local MQTT anymore
+  const { buses } = useData(); // <-- ADDED: Consume Context
   const [error, setError] = useState(null);
   const mapRef = useRef(null);
 
@@ -26,6 +25,15 @@ const AirQualityScreen = () => {
   const [busDirections, setBusDirections] = useState({}); // Track bus movement directions
   const previousBusPositions = useRef({});
   const [userLocation, setUserLocation] = useState(null);
+
+  // Time filter state for heatmap
+  const [timeRange, setTimeRange] = useState('1h');
+
+  // Simulation state
+  const [fakeBusPos, setFakeBusPos] = useState(null);
+  const [pmRange, setPmRange] = useState({ min: 10, max: 100 });
+  const [isDebugFabExpanded, setIsDebugFabExpanded] = useState(false);
+  const simulationInterval = useRef(null);
 
   const SUT_COORDINATES = {
     latitude: 14.8820,
@@ -41,43 +49,184 @@ const AirQualityScreen = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch buses API function
-  const fetchBusesAPI = useCallback(async () => {
-    try {
-      const apiKey = await checkApiKey();
-      if (!apiKey) return;
+  // Auto-zoom to user position when clicking tab
+  useFocusEffect(
+    useCallback(() => {
+      if (userLocation && mapRef.current) {
+        mapRef.current.animateToRegion({
+          latitude: userLocation.latitude,
+          longitude: userLocation.longitude,
+          latitudeDelta: 0.005,
+          longitudeDelta: 0.005,
+        });
+      }
+    }, [userLocation])
+  );
 
-      const apiUrl = await getApiUrl();
-      const response = await axios.get(`${apiUrl}/api/buses`, {
-        headers: getApiHeaders(),
-        timeout: 5000
+  // Cleanup effect: Remove fake bus trail when debug mode is disabled
+  useEffect(() => {
+    if (!debugMode) {
+      const clearFakeTrail = async () => {
+        try {
+          const url = await getApiUrl();
+          await axios.delete(`${url}/api/debug/location/FAKE_PM_BUS`, {
+            headers: getApiHeaders()
+          });
+          // Also remove the local fake bus marker if it exists
+          setFakeBusPos(null);
+        } catch (e) {
+          console.log("Error cleaning up fake trail:", e);
+        }
+      };
+      clearFakeTrail();
+    }
+  }, [debugMode]);
+
+  // Use DataContext buses to update directions
+  useEffect(() => {
+    if (buses && buses.length > 0) {
+      buses.forEach(bus => {
+        if (bus.current_lat && bus.current_lon) {
+          handleDirectionUpdate({
+            bus_mac: bus.bus_mac || bus.mac_address || bus.id,
+            lat: bus.current_lat,
+            lon: bus.current_lon
+          });
+        }
       });
-      const newBuses = response.data;
+    }
+  }, [buses]);
 
-      // Check for valid array before processing
-      if (newBuses && Array.isArray(newBuses)) {
-        // Add timestamp to initial fetch
-        const busesWithTime = newBuses.map(b => ({
-          ...b,
-          last_updated: Date.now() // Assume fresh on fetch
-        }));
-        updateBusesState(busesWithTime);
+  // Reload buses when screen gains focus (sync deletion) -> No longer needed, Context handles it
+  // But we might want to refresh? Context handles auto-refresh.
+
+  // Helper to handle direction updates from single data points
+  const handleDirectionUpdate = (data) => {
+    const busId = data.bus_mac;
+    const prevPos = previousBusPositions.current[busId];
+
+    // If we have a previous position and it's different
+    if (prevPos && (prevPos.lat !== data.lat || prevPos.lon !== data.lon)) {
+      const direction = {
+        lat: data.lat - prevPos.lat,
+        lon: data.lon - prevPos.lon,
+      };
+
+      setBusDirections(prev => {
+        const prevDirection = prev[busId];
+        if (prevDirection) {
+          const dotProduct = direction.lat * prevDirection.lat + direction.lon * prevDirection.lon;
+          const magnitude1 = Math.sqrt(direction.lat ** 2 + direction.lon ** 2);
+          const magnitude2 = Math.sqrt(prevDirection.lat ** 2 + prevDirection.lon ** 2);
+          // Avoid division by zero
+          if (magnitude1 > 0 && magnitude2 > 0) {
+            const cosAngle = dotProduct / (magnitude1 * magnitude2);
+            if (cosAngle < 0.7) {
+              setDestinationMarkers(d => {
+                const updated = { ...d };
+                delete updated[busId];
+                return updated;
+              });
+            }
+          }
+        }
+        return { ...prev, [busId]: direction };
+      });
+    }
+
+    // Update the ref
+    previousBusPositions.current[busId] = {
+      lat: data.lat,
+      lon: data.lon
+    };
+  };
+
+
+  const handleLongPress = (e) => {
+    if (!debugMode) return;
+    const { coordinate } = e.nativeEvent;
+
+    // Use a specific marker for debug bus destination if desired, 
+    // or just use common destination logic but for simulation.
+    setDestinationMarkers(prev => ({
+      ...prev,
+      ['FAKE_PM_BUS']: coordinate
+    }));
+  };
+
+  const toggleFakeBus = async () => {
+    if (fakeBusPos) {
+      setFakeBusPos(null);
+      // Immediately clear simulation trail from server when removed
+      try {
+        const url = await getApiUrl();
+        await axios.delete(`${url}/api/debug/location/FAKE_PM_BUS`, {
+          headers: getApiHeaders()
+        });
+        // Force map to refresh so the trail disappears instantly
+        if (mapRef.current?.refreshHeatmap) {
+          mapRef.current.refreshHeatmap(true);
+        }
+      } catch (e) {
+        console.log("Error cleaning up fake trail:", e);
+      }
+    } else {
+      const center = mapRef.current?.props?.initialRegion || SUT_COORDINATES;
+      const initialPos = { latitude: center.latitude, longitude: center.longitude };
+      setFakeBusPos(initialPos);
+      sendFakeData(initialPos);
+    }
+    setIsDebugFabExpanded(false);
+  };
+
+  const handleDragFakeBus = (e) => {
+    const { coordinate } = e.nativeEvent;
+    setFakeBusPos(coordinate);
+    sendFakeData(coordinate);
+  };
+
+  const sendFakeData = async (coord) => {
+    try {
+      const url = await getApiUrl();
+      const pmValue = Math.floor(Math.random() * (pmRange.max - pmRange.min + 1)) + pmRange.min;
+      await axios.post(`${url}/api/debug/location`, {
+        bus_mac: "FAKE_PM_BUS",
+        lat: coord.latitude,
+        lon: coord.longitude,
+        pm2_5: pmValue,
+        pm10: pmValue * 1.2
+      }, { headers: getApiHeaders() });
+
+      // Tell map to refresh its grid data to show the new point
+      if (mapRef.current?.refreshHeatmap) {
+        mapRef.current.refreshHeatmap();
       }
     } catch (err) {
-      console.log('Fetch failed (server may be offline):', err.message);
+      console.log("Error sending fake PM data:", err);
     }
-  }, []);
+  };
 
-  // ... (useFocusEffect and useEffect for MQTT stay same until setBuses) 
-  // Wait, I can't easily replace just the MQTT handler inner logic with replace_file_content safely due to indentation.
-  // I will use multi_replace.
+  // Zoom to specific bus
+  const zoomToBus = (bus) => {
+    if (bus.current_lat && bus.current_lon && mapRef.current) {
+      mapRef.current.animateToRegion({
+        latitude: bus.current_lat,
+        longitude: bus.current_lon,
+        latitudeDelta: 0.005,
+        longitudeDelta: 0.005,
+      });
+    } else {
+      Alert.alert('Location unavailable', 'This bus has no current location data.');
+    }
+  };
 
   const renderBusItem = ({ item }) => {
     const { status, solidColor } = getAirQualityStatus(item.pm2_5);
     const hasDestination = destinationMarkers[item.mac_address];
 
     // Check if offline (> 1 minute silence)
-    const isOffline = item.last_updated && (Date.now() - item.last_updated > 60000);
+    // Use (item.last_updated || 0) to handle null/undefined/0.
+    const isOffline = (Date.now() - (item.last_updated || 0)) > 60000;
     const opacity = isOffline ? 0.4 : 1.0;
 
     return (
@@ -125,179 +274,6 @@ const AirQualityScreen = () => {
     );
   };
 
-  // Reload buses when screen gains focus (sync deletion)
-  useFocusEffect(
-    useCallback(() => {
-      fetchBusesAPI();
-    }, [fetchBusesAPI])
-  );
-
-  useEffect(() => {
-    // Initial fetch
-    fetchBusesAPI();
-
-    // POLLING MECHANISM (HTTP-Only Mode)
-    // Replace MQTT with 2-second interval polling
-    const pollInterval = setInterval(() => {
-      fetchBusesAPI();
-    }, 2000);
-
-    return () => {
-      clearInterval(pollInterval);
-    };
-  }, [fetchBusesAPI]);
-
-  const getLocation = async () => {
-    try {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission denied', 'Location permission is required to zoom to your location.');
-        return;
-      }
-
-      const enabled = await Location.hasServicesEnabledAsync();
-      if (!enabled) {
-        console.warn('Location Services Disabled');
-        return;
-      }
-
-      // Try to get last known position first
-      let location = await Location.getLastKnownPositionAsync({});
-      if (!location) {
-        // If no last known location, try to get current position
-        location = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced,
-        });
-      }
-
-      if (location) {
-        setUserLocation(location.coords);
-      }
-    } catch (e) {
-      console.error("Error getting location:", e);
-    }
-  };
-
-  const zoomToLocation = async () => {
-    if (!userLocation) {
-      await getLocation();
-    }
-
-    if (userLocation && mapRef.current) {
-      mapRef.current.animateToRegion({
-        latitude: userLocation.latitude,
-        longitude: userLocation.longitude,
-        latitudeDelta: 0.005,
-        longitudeDelta: 0.005,
-      });
-    } else {
-      // Fallback to SUT
-      if (mapRef.current) {
-        mapRef.current.animateToRegion(SUT_COORDINATES);
-        Alert.alert('Location Unavailable', 'Zooming to Suranaree University of Technology (Default).');
-      }
-    }
-  };
-
-  // Helper to handle direction updates from single data points
-  const handleDirectionUpdate = (data) => {
-    const busId = data.bus_mac;
-    const prevPos = previousBusPositions.current[busId];
-
-    // If we have a previous position and it's different
-    if (prevPos && (prevPos.lat !== data.lat || prevPos.lon !== data.lon)) {
-      const direction = {
-        lat: data.lat - prevPos.lat,
-        lon: data.lon - prevPos.lon,
-      };
-
-      setBusDirections(prev => {
-        const prevDirection = prev[busId];
-        if (prevDirection) {
-          const dotProduct = direction.lat * prevDirection.lat + direction.lon * prevDirection.lon;
-          const magnitude1 = Math.sqrt(direction.lat ** 2 + direction.lon ** 2);
-          const magnitude2 = Math.sqrt(prevDirection.lat ** 2 + prevDirection.lon ** 2);
-          // Avoid division by zero
-          if (magnitude1 > 0 && magnitude2 > 0) {
-            const cosAngle = dotProduct / (magnitude1 * magnitude2);
-            if (cosAngle < 0.7) {
-              setDestinationMarkers(d => {
-                const updated = { ...d };
-                delete updated[busId];
-                return updated;
-              });
-            }
-          }
-        }
-        return { ...prev, [busId]: direction };
-      });
-    }
-
-    // Update the ref
-    previousBusPositions.current[busId] = {
-      lat: data.lat,
-      lon: data.lon
-    };
-  };
-
-  const updateBusesState = (newBuses) => {
-    setBuses(newBuses);
-    // Initialize previous positions
-    newBuses.forEach(bus => {
-      if (bus.current_lat && bus.current_lon) {
-        previousBusPositions.current[bus.mac_address] = {
-          lat: bus.current_lat,
-          lon: bus.current_lon
-        };
-      }
-    });
-  };
-
-
-  const handleLongPress = (e) => {
-    if (!debugMode) return;
-
-    const { coordinate } = e.nativeEvent;
-
-    // Find closest bus to assign destination
-    if (buses.length > 0) {
-      let closestBus = buses[0];
-      let minDistance = Infinity;
-
-      buses.forEach(bus => {
-        if (!bus.current_lat || !bus.current_lon) return;
-        const distance = Math.sqrt(
-          Math.pow(bus.current_lat - coordinate.latitude, 2) +
-          Math.pow(bus.current_lon - coordinate.longitude, 2)
-        );
-        if (distance < minDistance) {
-          minDistance = distance;
-          closestBus = bus;
-        }
-      });
-
-      // Set destination for closest bus
-      setDestinationMarkers(prev => ({
-        ...prev,
-        [closestBus.mac_address]: coordinate,
-      }));
-    }
-  };
-
-  // Zoom to specific bus
-  const zoomToBus = (bus) => {
-    if (bus.current_lat && bus.current_lon && mapRef.current) {
-      mapRef.current.animateToRegion({
-        latitude: bus.current_lat,
-        longitude: bus.current_lon,
-        latitudeDelta: 0.005,
-        longitudeDelta: 0.005,
-      });
-    } else {
-      Alert.alert('Location unavailable', 'This bus has no current location data.');
-    }
-  };
-
 
 
   if (Platform.OS === 'web') {
@@ -323,34 +299,49 @@ const AirQualityScreen = () => {
           userLocation={userLocation}
           destinationMarkers={destinationMarkers}
           onLongPress={handleLongPress}
-          onZoomToLocation={zoomToLocation}
+          timeRange={timeRange}
+          onTimeRangeChange={setTimeRange}
+          fakeBusPos={fakeBusPos}
+          onDragFakeBus={handleDragFakeBus}
         />
 
-        {/* PM Zone Editor Launch Button */}
+        {/* Debug FAB (Top Left) */}
         {debugMode && (
-          <TouchableOpacity
-            style={{
-              position: 'absolute',
-              bottom: 40,
-              left: 20,
-              backgroundColor: '#ef4444',
-              borderRadius: 50,
-              width: 50,
-              height: 50,
-              justifyContent: 'center',
-              alignItems: 'center',
-              elevation: 5,
-              shadowColor: '#000',
-              shadowOffset: { width: 0, height: 2 },
-              shadowOpacity: 0.25,
-              shadowRadius: 3.84,
-              zIndex: 1000
-            }}
-            onPress={() => navigation.navigate('PMZoneEditor')}
-          >
-            <Ionicons name="map" size={24} color="white" />
-          </TouchableOpacity>
+          <View style={styles.debugFabContainer}>
+            <TouchableOpacity
+              style={styles.debugFab}
+              onPress={() => setIsDebugFabExpanded(!isDebugFabExpanded)}
+            >
+              <Ionicons name={isDebugFabExpanded ? "close" : "bug"} size={20} color="white" />
+            </TouchableOpacity>
+            {isDebugFabExpanded && (
+              <View style={styles.debugPanel}>
+                <Text style={styles.debugPanelTitle}>PM Simulation Tools</Text>
+                <TouchableOpacity style={styles.debugActionBtn} onPress={toggleFakeBus}>
+                  <Text style={styles.debugActionText}>
+                    {fakeBusPos ? "🛑 Remove Fake Bus" : "🚌 Spawn Fake Bus"}
+                  </Text>
+                </TouchableOpacity>
+
+                <View style={styles.pmRangeRow}>
+                  <Text style={styles.rangeLabel}>PM Range:</Text>
+                  <TouchableOpacity onPress={() => setPmRange({ min: 10, max: 40 })} style={[styles.rangeBtn, pmRange.max <= 40 && styles.rangeBtnActive]}>
+                    <Text style={styles.rangeBtnText}>Low</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => setPmRange({ min: 40, max: 80 })} style={[styles.rangeBtn, pmRange.max > 40 && pmRange.max <= 80 && styles.rangeBtnActive]}>
+                    <Text style={styles.rangeBtnText}>Med</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => setPmRange({ min: 80, max: 150 })} style={[styles.rangeBtn, pmRange.max > 80 && styles.rangeBtnActive]}>
+                    <Text style={styles.rangeBtnText}>High</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.rangeHint}>Drag bus to paint trail ({pmRange.min}-{pmRange.max} µg/m³)</Text>
+              </View>
+            )}
+          </View>
         )}
+
+
       </View>
 
       {debugMode && (
@@ -362,12 +353,6 @@ const AirQualityScreen = () => {
       <View style={styles.listContainer}>
         <View style={styles.listHeader}>
           <Text style={styles.listTitle}>Live Bus Air Quality</Text>
-          <TouchableOpacity
-            style={styles.dashboardButton}
-            onPress={() => navigation.navigate('AirQualityDashboard', { buses })}
-          >
-            <Ionicons name="stats-chart" size={22} color="#2196F3" />
-          </TouchableOpacity>
         </View>
         {error && <Text style={styles.error}>{error}</Text>}
         <FlatList
@@ -408,10 +393,26 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 10,
   },
-  dashboardButton: {
-    padding: 8,
-    borderRadius: 8,
-    backgroundColor: 'rgba(33, 150, 243, 0.1)',
+  timeFilterContainer: {
+    flexDirection: 'row',
+    gap: 5,
+  },
+  timeFilterBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: '#e5e7eb',
+  },
+  timeFilterBtnActive: {
+    backgroundColor: '#3b82f6',
+  },
+  timeFilterText: {
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#666',
+  },
+  timeFilterTextActive: {
+    color: 'white',
   },
   listTitle: {
     fontSize: 20,
@@ -500,6 +501,86 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     textAlign: 'center',
     fontSize: 14,
+  },
+  debugFabContainer: {
+    position: 'absolute',
+    top: 60,
+    left: 20,
+    alignItems: 'flex-start',
+    zIndex: 2000,
+  },
+  debugFab: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: '#ef4444',
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4.65,
+  },
+  debugPanel: {
+    backgroundColor: 'white',
+    borderRadius: 15,
+    padding: 15,
+    marginTop: 10,
+    width: 250,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4.65,
+  },
+  debugPanelTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    color: '#333',
+  },
+  debugActionBtn: {
+    backgroundColor: '#ef4444',
+    padding: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 15,
+  },
+  debugActionText: {
+    color: 'white',
+    fontWeight: 'bold',
+  },
+  pmRangeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  rangeLabel: {
+    fontSize: 12,
+    color: '#666',
+    fontWeight: '600',
+  },
+  rangeBtn: {
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    backgroundColor: '#f3f4f6',
+    borderRadius: 15,
+  },
+  rangeBtnActive: {
+    backgroundColor: '#2196F3',
+  },
+  rangeBtnText: {
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#444',
+  },
+  rangeHint: {
+    fontSize: 10,
+    color: '#999',
+    fontStyle: 'italic',
+    textAlign: 'center',
   },
 });
 

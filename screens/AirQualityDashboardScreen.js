@@ -17,9 +17,9 @@ import axios from 'axios';
 import { getApiUrl, getApiHeaders } from '../config/api';
 import { useTheme } from '../contexts/ThemeContext';
 import { getAirQualityStatus } from '../utils/airQuality';
-import { getConnectionMode } from '../config/api';
+import { MQTT_CONFIG, getConnectionMode } from '../config/api';
 import { useServerConfig } from '../hooks/useServerConfig';
-// import * as mqtt from 'mqtt'; // Removed
+import * as mqtt from 'mqtt';
 
 const { width: screenWidth } = Dimensions.get('window');
 
@@ -47,8 +47,70 @@ const AirQualityDashboardScreen = ({ route }) => {
     const [selectedBus, setSelectedBus] = useState(null); // null = All Buses
     const [liveBusData, setLiveBusData] = useState(null); // Data for the "Now" view
 
-    // MQTT Logic Removed
-    // useEffect(() => { ... }, []);
+    // MQTT Connection for Real-time Updates
+    useEffect(() => {
+        let client;
+
+        const connectMqtt = async () => {
+            // Only connect if we are in "Now" mode (timeRange === 0)
+            if (timeRange !== 0 || Platform.OS === 'web') return;
+
+            try {
+                const isTunnelMode = getConnectionMode() === 'tunnel';
+                let mqttUrl;
+
+                if (isTunnelMode && MQTT_CONFIG.wsUrl) {
+                    mqttUrl = MQTT_CONFIG.wsUrl;
+                } else if (serverIp) {
+                    mqttUrl = `ws://${serverIp}:${MQTT_CONFIG.wsPort || 9001}`;
+                } else {
+                    return;
+                }
+
+                client = mqtt.connect(mqttUrl);
+
+                client.on('connect', () => {
+                    client.subscribe('sut/app/bus/location');
+                    client.subscribe('sut/bus/gps/fast');
+                });
+
+                client.on('message', (topic, message) => {
+                    try {
+                        const data = JSON.parse(message.toString());
+                        // Check if this message is for our current selected/live bus
+                        if (timeRange === 0) {
+                            const targetMac = selectedBus ? (selectedBus.bus_mac || selectedBus.mac_address) : data.bus_mac;
+
+                            if (data.bus_mac === targetMac) {
+                                setLiveBusData(prev => ({
+                                    ...prev,
+                                    // Defensive updates
+                                    pm2_5: (data.pm2_5 !== undefined && data.pm2_5 !== null) ? data.pm2_5 : (prev?.pm2_5),
+                                    pm10: (data.pm10 !== undefined && data.pm10 !== null) ? data.pm10 : (prev?.pm10),
+                                    temp: (data.temp !== undefined && data.temp !== null) ? data.temp : (prev?.temp),
+                                    hum: (data.hum !== undefined && data.hum !== null) ? data.hum : (prev?.hum),
+                                    // Always update location/name
+                                    bus_mac: data.bus_mac,
+                                    bus_name: data.bus_name || prev?.bus_name || 'Bus',
+                                }));
+                            }
+                        }
+                    } catch (e) {
+                        console.error('[Dashboard] MQTT Parse Error', e);
+                    }
+                });
+
+            } catch (e) {
+                console.error('[Dashboard] MQTT Error', e);
+            }
+        };
+
+        connectMqtt();
+
+        return () => {
+            if (client) client.end();
+        };
+    }, [timeRange, serverIp, selectedBus]);
 
     // Load map components
     useEffect(() => {

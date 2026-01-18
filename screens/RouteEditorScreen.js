@@ -23,12 +23,16 @@ const RouteEditorScreen = () => {
     const [saving, setSaving] = useState(false);
     const [userLocation, setUserLocation] = useState(null);
     const [showGrid, setShowGrid] = useState(false); // Grid overlay state
+    const [showRoutes, setShowRoutes] = useState(false); // Toggle to show other existing routes
 
     // Waypoint editing state
     const [modalVisible, setModalVisible] = useState(false);
     const [editingIndex, setEditingIndex] = useState(null);
     const [tempStopName, setTempStopName] = useState('');
     const [tempIsStop, setTempIsStop] = useState(false);
+
+    // Existing Routes for Reference
+    const [existingRoutes, setExistingRoutes] = useState([]);
 
     // Bus Linking State
     const [buses, setBuses] = useState([]);
@@ -89,6 +93,9 @@ const RouteEditorScreen = () => {
                 fetchBuses();
             }
 
+            // Fetch existing routes for reference layer
+            fetchExistingRoutes();
+
             // Get user location for initial map region
             try {
                 const { status } = await Location.requestForegroundPermissionsAsync();
@@ -121,6 +128,34 @@ const RouteEditorScreen = () => {
                 console.log("Error fetching buses:", error);
             }
         };
+
+        const fetchExistingRoutes = async () => {
+            try {
+                const ip = await AsyncStorage.getItem('serverIp');
+                const port = await AsyncStorage.getItem('apiPort');
+                const host = ip || '183.89.203.247'; // Default fallback
+                const apiPort = port || '8000';
+                const apiUrl = `http://${host}:${apiPort}`;
+
+                const response = await axios.get(`${apiUrl}/api/routes`);
+                if (response.data && Array.isArray(response.data)) {
+                    // Fetch stops for each route
+                    const fullRoutes = await Promise.all(response.data.map(async (r) => {
+                        try {
+                            const stopsRes = await axios.get(`${apiUrl}/api/routes/${r.id}/stops`);
+                            return { ...r, waypoints: stopsRes.data || [] };
+                        } catch (e) {
+                            return { ...r, waypoints: [] };
+                        }
+                    }));
+                    if (isMounted) {
+                        setExistingRoutes(fullRoutes);
+                    }
+                }
+            } catch (error) {
+                console.log("Error fetching reference routes:", error);
+            }
+        }
 
         init();
         fetchBuses();
@@ -294,6 +329,36 @@ const RouteEditorScreen = () => {
                 }}
                 onLongPress={handleMapPress}
             >
+                {/* Reference Routes Layer */}
+                {showRoutes && existingRoutes.map((route, i) => (
+                    <React.Fragment key={`ref-route-${i}`}>
+                        {/* Dimmed Polyline */}
+                        <Polyline
+                            coordinates={route.waypoints}
+                            strokeColor={route.routeColor || '#999'}
+                            strokeWidth={3}
+                            lineDashPattern={[5, 10]} // Dashed line for reference
+                            style={{ opacity: 0.4 }} // Fade out
+                        />
+                        {/* Bus Stops on Reference Route */}
+                        {route.waypoints.filter(w => w.isStop).map((stop, j) => (
+                            <Marker
+                                key={`ref-stop-${i}-${j}`}
+                                coordinate={stop}
+                                anchor={{ x: 0.5, y: 0.5 }}
+                                pointerEvents="none" // Non-interactive
+                            >
+                                <View style={{
+                                    width: 10, height: 10, borderRadius: 5,
+                                    backgroundColor: route.routeColor || '#999',
+                                    opacity: 0.6,
+                                    borderWidth: 1, borderColor: 'white'
+                                }} />
+                            </Marker>
+                        ))}
+                    </React.Fragment>
+                ))}
+
                 {waypoints.length > 0 && (
                     <Polyline
                         coordinates={waypoints}
@@ -343,6 +408,14 @@ const RouteEditorScreen = () => {
                 onPress={() => setShowGrid(!showGrid)}
             >
                 <Text style={{ fontSize: 20 }}>#️⃣</Text>
+            </TouchableOpacity>
+
+            {/* Show Routes Toggle Button */}
+            <TouchableOpacity
+                style={[styles.gridButton, { bottom: 160 }]} // Stack above Grid button
+                onPress={() => setShowRoutes(!showRoutes)}
+            >
+                <Ionicons name={showRoutes ? "eye" : "eye-off"} size={22} color="#333" />
             </TouchableOpacity>
 
             {showGrid && <GridOverlay />}
